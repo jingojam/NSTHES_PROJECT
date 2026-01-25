@@ -5,6 +5,7 @@
 
 ** Guide **
 Execute these commands in a terminal (in order):
+
 0) `cd $HOME` -> this is generally `/home/<user>`, to check: `echo $HOME`
 1) `git clone https://github.com/jingojam/NSTHES_PROJECT`
 2) `cd NSTHES_PROJECT/`
