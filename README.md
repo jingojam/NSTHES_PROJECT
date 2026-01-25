@@ -3,6 +3,9 @@
 ** System Dependencies **
 - OS: Ubuntu 24.04.3 LTS (VMWare)
 
+** Additional Dependencies **
+- Make sure you have configured git in your VM for pull/push access rights to repos
+
 ** Guide **
 Execute these commands in a terminal (in order):
 
