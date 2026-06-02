@@ -5,9 +5,10 @@ import(
 	"context"
 	"crypto/tls"
 	"net"
-	//"io"
+	"io"
 	"os"
 	"time"
+	"errors"
 
 	"github.com/quic-go/quic-go"
 	"github.com/mengelbart/roq"
@@ -33,6 +34,7 @@ var(
 */
 type Server struct{
 	address string
+	quicConnection quic.Connection
 	sendFlow *roq.SendFlow
 	packetizer rtp.Packetizer
 }
@@ -41,33 +43,32 @@ type Server struct{
 func CreateServer(address string) *Server{
 	return &Server{
 		address: address,
+		quicConnection: nil,
 		sendFlow: nil,
 		packetizer: rtp.NewPacketizer(mtu, pt, ssrc, payloader, sequencer, clockRate),
 	}
 }
 
 // pointer receiver for initializing QUIC connection
-func (server *Server) CreateQUICConnection() (quic.Connection, error){
+func (server *Server) CreateQUICConnection() error{
 	//read self-signed CA cert
 	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	
 	if err != nil{
-		fmt.Printf("Error loading self-signed certificate: %v\n", err)
-		return nil, fmt.Errorf("Error loading self-signed certificate: %v\n", err)
+		return fmt.Errorf("[Error] Error loading self-signed certificate: %v\n", err)
 	}
 	
 	udpAddress, err := net.ResolveUDPAddr("udp", server.address)
 
 	if err != nil{
-		fmt.Printf("Error listening on UDP socket: %v\n", err)
-		return nil, fmt.Errorf("Error listening on UDP socket: %v\n", err)
+		return fmt.Errorf("[Error] Error resoving address: %v\n", err)
 	}
 	
 	//create a base UDP socket beneathe QUIC
 	udpConnection, err := net.ListenUDP("udp", udpAddress)
 	
 	if err != nil{
-		return nil, fmt.Errorf("Error establishing UDP connection: %v", err)
+		return fmt.Errorf("[Error] Error listening on UDP socket: %v\n", err)
 	}
 	
 	quicTransport := &quic.Transport{Conn: udpConnection}
@@ -91,61 +92,59 @@ func (server *Server) CreateQUICConnection() (quic.Connection, error){
 	listener, err := quicTransport.Listen(tlsConfig, quicConfig)
 	
 	if err != nil{
-		fmt.Printf("Error starting QUIC listener: %v\n", err)
-		return nil, fmt.Errorf("Error starting QUIC listener: %v\n", err)
+		return fmt.Errorf("[Error] Error starting QUIC listener: %v\n", err)
 	}
 	
-	quicConnection, err := listener.Accept(context.Background())
+	server.quicConnection, err = listener.Accept(context.Background())
 	
 	if err != nil{
-		fmt.Printf("Error accepting QUIC connection: %v\n", err)
-		return nil, fmt.Errorf("Error accepting QUIC connection: %v\n", err)
+		server.quicConnection = nil
+		return fmt.Errorf("[Error] Error accepting QUIC connection: %v\n", err)
 	}
 
-	fmt.Printf("Accepted connection from %s\n", quicConnection.RemoteAddr())
-	
-	return quicConnection, err
+	fmt.Printf("[Status] Accepted connection from %s\n", server.quicConnection.RemoteAddr())
+	return nil
 }
 
 // pointer receiver for iniializing server session and flow
 func (server *Server) InitializeServer() error{
-	quicConnection, err := server.CreateQUICConnection()
+	err := server.CreateQUICConnection()
 	
 	if err != nil{
-		return fmt.Errorf("Error establishing QUIC connection: %w\n", err)
+		return fmt.Errorf("[Error] Error establishing QUIC connection: %w\n", err)
 	}
 	
 	// escalate the base quic connection into ROQ
-	roqConnection := roq.NewQUICGoConnection(quicConnection)
+	roqConnection := roq.NewQUICGoConnection(server.quicConnection)
 	session, err := roq.NewSession(roqConnection, false, nil)
 	
 	if err != nil{
-		quicConnection.CloseWithError(0, "QUIC connection closed.")
-		return fmt.Errorf("Error establishing session: %w\n", err)
+		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
+		return fmt.Errorf("[Error] Error establishing session: %w\n", err)
 	}
 	
 	// create a sender flow for QUIC packets
 	server.sendFlow, err = session.NewSendFlow(flowID)
 	
 	if err != nil{
-		quicConnection.CloseWithError(0, "QUIC connection closed.")
-		return fmt.Errorf("Error establishing send flow: %w\n", err)
+		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
+		return fmt.Errorf("[Error] Error establishing send flow: %w\n", err)
 	}
 	
+	fmt.Println("[Status] Server initialized")
 	return nil
 }
 
 // pointer receiver for opening video file and streaming
-func (server *Server) SendRTP(vfilepath string){
+func (server *Server) SendRTP(vfilepath string) error{
 	// access the video file
 	vfile, err := os.Open(vfilepath)
 	
 	if err != nil{
-		fmt.Printf("Error opening video file: %v\n", err)
-		return
+		return fmt.Errorf("[Error] Error opening video file: %v\n", err)
 	}
 	
-	fmt.Printf("Streaming video source %s\n", vfilepath)
+	fmt.Printf("[Status] Streaming video source %s\n", vfilepath)
 	
 	// h264 reader 
 	reader, _ := h264reader.NewReader(vfile)
@@ -160,8 +159,11 @@ func (server *Server) SendRTP(vfilepath string){
 		nal, err := reader.NextNAL()
 		
 		if err != nil{
-			fmt.Printf("Error extracting NAL unit: %v\n", err)
-			return
+			if errors.Is(err, io.EOF){
+				fmt.Println("[Status ] Video ended")
+				break
+			}
+			return fmt.Errorf("[Error] Error extracting NAL unit: %v\n", err)
 		}
 		
 		//skip empty nal units
@@ -180,7 +182,15 @@ func (server *Server) SendRTP(vfilepath string){
 		}
 	}
 	
+	fmt.Printf("[Status] Streaming finished.")
 	vfile.Close()
+	
+	return nil
+}
+
+func (server *Server) CloseServer(){
+	server.sendFlow.Close()
+	server.quicConnection.CloseWithError(0, "[Status] QUIC connection closed.")
 }
 
 func main(){
@@ -195,12 +205,21 @@ func main(){
 	}
 
 	server := CreateServer(addr)
-	fmt.Println("Server Created")
+	fmt.Println("[Status] Server Created")
 
 	if err := server.InitializeServer(); err != nil{
-		fmt.Printf("Initialization failed: %v\n", err)
+		fmt.Printf("[Error] Server initialization failed: %v\n", err)
+		server.CloseServer()
 		os.Exit(1)
 	}
 
-	server.SendRTP(vfilepath)
+	err := server.SendRTP(vfilepath)
+	
+	if err != nil{
+		fmt.Printf("[Error] Error sending RTP: %v\n", err)
+		server.CloseServer()
+		os.Exit(1)
+	}
+	
+	server.CloseServer()
 }

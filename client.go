@@ -11,29 +11,37 @@ import(
 	"github.com/quic-go/quic-go"
 	"github.com/mengelbart/roq"
 	"github.com/pion/rtp"
-	//"github.com/pion/rtp/codecs/h264"
+	"github.com/pion/rtp/codecs"
 )
 
 const flowID uint64 = 1
+var annexBCode = []byte{0x00, 0x00, 0x00, 0x01}
 
 type Client struct{
 	address string
+	quicConnection quic.Connection
 	receiveFlow *roq.ReceiveFlow
+	depacketizer rtp.Depacketizer
 }
 
 func CreateClient(address string) *Client{
-	return &Client{receiveFlow: nil, address: address}
+	return &Client{
+		address: address,
+		quicConnection: nil,
+		receiveFlow: nil,
+		depacketizer: &codecs.H264Packet{},
+	}
 }
 
 // pointer receiver for initializing QUIC connection
-func (client *Client) CreateQUICConnection() (quic.Connection, error){
+func (client *Client) CreateQUICConnection() error{
 	udpAddress := &net.UDPAddr{IP: nil, Port: 0}
 	
 	//create a base UDP socket beneathe QUIC
 	udpConnection, err := net.ListenUDP("udp", udpAddress)
 	
 	if err != nil{
-		return nil, fmt.Errorf("Error establishing UDP connection: %v", err)
+		return fmt.Errorf("[Error] Error establishing UDP connection: %v", err)
 	}
 	
 	quicTransport := &quic.Transport{Conn: udpConnection}
@@ -46,53 +54,54 @@ func (client *Client) CreateQUICConnection() (quic.Connection, error){
 	serverAddress, err := net.ResolveUDPAddr("udp", client.address)
 
 	if err != nil{
-		return nil, fmt.Errorf("Error resolving address: %v", err)
+		return fmt.Errorf("[Error] Error resolving address: %v", err)
 	}
 	
 	// dialearly is for establishing new connection to peer
 	//  but uses 0-RTT otherwise if available (not sure how this is triggered for now)
-	quicConnection, err := quicTransport.DialEarly(context.Background(), serverAddress, tlsConfig, quicConfig)
+	client.quicConnection, err = quicTransport.DialEarly(context.Background(), serverAddress, tlsConfig, quicConfig)
 	
 	if err != nil{
-		return nil, fmt.Errorf("Error establishing QUIC connection: %v", err)
+		client.quicConnection = nil
+		return fmt.Errorf("[Error] Error establishing QUIC connection: %v", err)
 	}
 	
-	return quicConnection, err
+	return nil
 }
 
 
 func (client *Client) InitializeClient() error{
-	quicConnection, err := client.CreateQUICConnection()
+	err := client.CreateQUICConnection()
 	
 	if err != nil{
-		return fmt.Errorf("Error establishing QUIC connection: %w\n", err)
+		return fmt.Errorf("[Error] Error establishing QUIC connection: %w\n", err)
 	}
 	
 	// escalate the base quic connection into ROQ
-	roqConnection := roq.NewQUICGoConnection(quicConnection)
+	roqConnection := roq.NewQUICGoConnection(client.quicConnection)
 	session, err := roq.NewSession(roqConnection, false, nil)
 	
 	if err != nil{
-		quicConnection.CloseWithError(0, "QUIC connection closed.")
-		return fmt.Errorf("Error establishing session: %w\n", err)
+		client.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
+		return fmt.Errorf("[Error] Error establishing session: %w\n", err)
 	}
 	
 	// create a sender flow for QUIC packets
 	client.receiveFlow, err = session.NewReceiveFlow(flowID)
 	
 	if err != nil{
-		quicConnection.CloseWithError(0, "QUIC connection closed.")
-		return fmt.Errorf("Error establishing send flow: %w\n", err)
+		client.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
+		return fmt.Errorf("[Error] Error establishing send flow: %w\n", err)
 	}
 	
-	fmt.Printf("Listening...\n")
+	fmt.Printf("[Status] Listening...\n")
 	
 	return nil
 }
 
-func (client *Client) ReceiveRTP() error{
+func (client *Client) ReceiveRTP(){
 	buffer := make([]byte, 1500)
-	
+
 	for{
 		size, err := client.receiveFlow.Read(buffer)
 		
@@ -108,12 +117,25 @@ func (client *Client) ReceiveRTP() error{
 		
 		//unmarshal only the actual bytes (0 to size)
 		if err := packet.Unmarshal(buffer[:size]); err != nil{
-			fmt.Printf("Error unmarshaling RTP: %v\n", err)
+			fmt.Printf("[Error] Error unmarshaling RTP: %v\n", err)
 			continue //skip the packet and look for the next one
 		}
+			
+		nal, err := client.depacketizer.Unmarshal(packet.Payload)
+			
+		if err != nil || len(nal) ==0{
+			continue
+		}
 
-		fmt.Printf("RTP: {pt: %d | seq: %d | ssrc: 0x%X | timestamp: %d | sizeof payload: %d bytes}\n", packet.PayloadType, packet.SequenceNumber, packet.SSRC, packet.Timestamp, len(packet.Payload))
+		fmt.Printf("[RTP] {pt: %d | seq: %d | ssrc: 0x%X | timestamp: %d | sizeof payload: %d bytes}\n", packet.PayloadType, packet.SequenceNumber, packet.SSRC, packet.Timestamp, len(packet.Payload))
 	}
+	
+	fmt.Printf("[Status] Streaming finished")
+}
+
+func (client *Client) CloseClient(){
+	client.receiveFlow.Close()
+	client.quicConnection.CloseWithError(0, "QUIC connection closed.")
 }
 
 func main() {
@@ -124,12 +146,13 @@ func main() {
 	}
 
 	client := CreateClient(addr)
-	fmt.Println("Client Created")
+	fmt.Println("[Status] Client Created")
 	
 	if err := client.InitializeClient(); err != nil{
-		fmt.Printf("Initialization failed: %v\n", err)
+		fmt.Printf("[Error] Client initialization failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	client.ReceiveRTP()
+	client.CloseClient()
 }
