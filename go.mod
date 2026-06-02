@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/mengelbart/roq v0.3.0
 	github.com/pion/rtp v1.10.2
+	github.com/pion/webrtc/v3 v3.2.28
 	github.com/quic-go/quic-go v0.47.0
 )
 
