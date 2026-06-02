@@ -85,7 +85,7 @@ func (client *Client) InitializeClient() error{
 		return fmt.Errorf("Error establishing send flow: %w\n", err)
 	}
 	
-	fmt.Printf("Listening...")
+	fmt.Printf("Listening...\n")
 	
 	return nil
 }
@@ -94,24 +94,26 @@ func (client *Client) ReceiveRTP() error{
 	buffer := make([]byte, 1500)
 	
 	for{
-		_, err := client.receiveFlow.Read(buffer)
+		size, err := client.receiveFlow.Read(buffer)
 		
 		if err != nil{
-			return fmt.Errorf("Error in read flow: %w\n", err)
-		}
-		
-		packet := &rtp.Packet{}
-		rawb := packet.Unmarshal(buffer)
-		
-		if rawb != nil{
-			return fmt.Errorf("Error unmarshaling RTP: %w\n", err)
 			continue
 		}
 		
-		fmt.Printf("RTP: {pt: %d | seq: %d | ssrc: 0x%X | timestamp: %d | payload: %d | sizeof payload: %d bytes}", packet.PayloadType, packet.SequenceNumber, packet.Timestamp, packet.Payload, len(packet.Payload))
+		if size == 0{
+			continue
+		}
+		
+		packet := &rtp.Packet{}
+		
+		//unmarshal only the actual bytes (0 to size)
+		if err := packet.Unmarshal(buffer[:size]); err != nil{
+			fmt.Printf("Error unmarshaling RTP: %v\n", err)
+			continue //skip the packet and look for the next one
+		}
+
+		fmt.Printf("RTP: {pt: %d | seq: %d | ssrc: 0x%X | timestamp: %d | sizeof payload: %d bytes}\n", packet.PayloadType, packet.SequenceNumber, packet.SSRC, packet.Timestamp, len(packet.Payload))
 	}
-	
-	return nil
 }
 
 func main() {

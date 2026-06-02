@@ -48,6 +48,14 @@ func CreateServer(address string) *Server{
 
 // pointer receiver for initializing QUIC connection
 func (server *Server) CreateQUICConnection() (quic.Connection, error){
+	//read self-signed CA cert
+	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	
+	if err != nil{
+		fmt.Printf("Error loading self-signed certificate: %v\n", err)
+		return nil, fmt.Errorf("Error loading self-signed certificate: %v\n", err)
+	}
+	
 	udpAddress, err := net.ResolveUDPAddr("udp", server.address)
 
 	if err != nil{
@@ -65,8 +73,19 @@ func (server *Server) CreateQUICConnection() (quic.Connection, error){
 	quicTransport := &quic.Transport{Conn: udpConnection}
 	
 	// set alpn for tls handshake (roq-10) is the standard for roq
-	//  not sure if crucial but InsecureSkipVerify is true which means any tls cert is accepted
-	tlsConfig := &tls.Config{NextProtos: []string{"roq-10"}, InsecureSkipVerify: true}
+	// set the  tls certificate to the loaded CA cert as well
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert}, 
+		NextProtos: []string{"roq-10"}, 
+		
+		// accept client regardless of client cert (for now)
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error){
+			return &tls.Config{
+				Certificates: []tls.Certificate{cert}, 
+				NextProtos: []string{"roq-10"},
+			}, nil
+		},
+	}
 	quicConfig := &quic.Config{EnableDatagrams: true} // configure quic to use quic datagrams
 
 	listener, err := quicTransport.Listen(tlsConfig, quicConfig)
@@ -145,12 +164,8 @@ func (server *Server) SendRTP(vfilepath string){
 			return
 		}
 		
-		if nal == nil{
-			break
-		}
-		
 		//skip empty nal units
-		if len(nal.Data) == 0{
+		if nal == nil || len(nal.Data) == 0{
 			continue
 		}
 
