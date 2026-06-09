@@ -20,8 +20,8 @@ go build -o abroq-baseline main.go
 # The Mininet Baseline Execution Guide
 
 1. Start the Network & Open Terminals
-sudo mn
-mininet> xterm h1 h1 h2 h2
+1. sudo mn
+2. mininet> xterm h1 h1 h2 h2
 
 2. Start the Receiver (h2 - Window 1)
 ./abroq-baseline -role=receiver -addr=0.0.0.0:4321
