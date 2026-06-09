@@ -19,20 +19,20 @@ go build -o abroq-baseline main.go
 
 # The Mininet Baseline Execution Guide
 
-1. Start the Network & Open Terminals
-sudo mn
-mininet> xterm h1 h1 h2 h2
+# Start the Network & Open Terminals
+1. sudo mn 
+2. mininet> xterm h1 h1 h2 h2
 
-2. Start the Receiver (h2 - Window 1)
+# Start the Receiver (h2 - Window 1)
 ./abroq-baseline -role=receiver -addr=0.0.0.0:4321
 
-3. Start the Video Player (h2 - Window 2)
+# Start the Video Player (h2 - Window 2)
 gst-launch-1.0 udpsrc port=6004 ! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96 ! rtph264depay ! avdec_h264 ! videoconvert ! autovideosink sync=false
 
-4. Start the Sender Proxy (h1 - Window 1)
+# Start the Sender Proxy (h1 - Window 1)
 (Note the IP is 10.0.0.2 to target h2 across the Mininet link)
 ./abroq-baseline -role=sender -addr=10.0.0.2:4321
 
-5. Inject the Video Feed (h1 - Window 2)
+# Inject the Video Feed (h1 - Window 2)
 (This pushes the video into the Sender Proxy on h1's local port)
 gst-launch-1.0 videotestsrc ! video/x-raw,format=I420,width=640,height=480 ! videoconvert
