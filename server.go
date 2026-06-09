@@ -5,60 +5,94 @@ import(
 	"context"
 	"crypto/tls"
 	"net"
-	"io"
 	"os"
-	"time"
-	"errors"
+	"strings"
+	"strconv"
 
 	"github.com/quic-go/quic-go"
 	"github.com/mengelbart/roq"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
-	"github.com/pion/webrtc/v3/pkg/media/h264reader"
-	//"github.com/pion/rtp/codecs/h264"
+	"github.com/go-gst/go-gst/gst"
+	"github.com/go-gst/go-gst/gst/app"
+	"github.com/go-gst/go-glib/glib"
 )
 
-// reference for these values: https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml
-var(
-	payloader = &codecs.H264Payloader{}
-	sequencer = rtp.NewRandomSequencer()
-	mtu uint16 = 1200
-	pt uint8 = 96
-	ssrc uint32 = 0xC0FFEE 
-	clockRate uint32 = 90000
-	flowID uint64 = 1
-)
+var flowID uint64 = 1
 
 /*
 	RTP/QUIC Server
 */
 type Server struct{
-	address string
+	/*Network attributes*/
+	ip 	 string
+	port uint64
+	
+	/*QUIC transport attributes*/
 	quicConnection quic.Connection
-	sendFlow *roq.SendFlow
-	packetizer rtp.Packetizer
+	sendFlow 	   *roq.SendFlow
+	
+	/*GStreamer pipeline elements*/
+	pipeline  *gst.Pipeline
+	source 	  *gst.Element
+	parser    *gst.Element
+	demux     *gst.Element
+	payloader *gst.Element
+	sink 	  *gst.Element
 }
 
-// Server constructor
-func CreateServer(address string) *Server{
+func CreateServer(ip string, port uint64) *Server{
 	return &Server{
-		address: address,
+		ip:             ip,
+		port:   		port,
 		quicConnection: nil,
-		sendFlow: nil,
-		packetizer: rtp.NewPacketizer(mtu, pt, ssrc, payloader, sequencer, clockRate),
+		sendFlow: 		nil,
+		pipeline: 		nil,
+		source: 		nil,
+		demux: 			nil,
+		parser: 		nil,
+		payloader: 		nil,
+		sink: 			nil,
 	}
 }
 
-// pointer receiver for initializing QUIC connection
+func (server *Server) InitializePipeline(videoFile string){
+	//pipeline string
+	pipeline := fmt.Sprintf(
+		`filesrc location=%s name=source !` + 
+		`qtdemux name=demux demux.video_0 !` +
+		`queue !` +
+		`h264parse name=parser !` +
+		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 !` +
+		`appsink name=sink max-buffers=1`, videoFile,
+	)
+	
+	server.pipeline, _ = gst.NewPipelineFromString(pipeline)
+	
+	//set the attributes by fetching each pipeline
+	server.source, _    = server.pipeline.GetElementByName("source")
+	server.demux, _     = server.pipeline.GetElementByName("demux")
+	server.parser, _    = server.pipeline.GetElementByName("parser")
+	server.payloader, _ = server.pipeline.GetElementByName("payloader")
+	server.sink, _ 		= server.pipeline.GetElementByName("sink")
+}
+
 func (server *Server) CreateQUICConnection() error{
+	cwd, err := os.Getwd()
+	
+	if err != nil{
+		return fmt.Errorf("[Error] Unable to fetch current working directory: %v\n", err)
+	}
+	
+	certPath := cwd + "/server.crt"
+	keyPath  := cwd + "/server.key"
+	
 	//read self-signed CA cert
-	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	
 	if err != nil{
 		return fmt.Errorf("[Error] Error loading self-signed certificate: %v\n", err)
 	}
 	
-	udpAddress, err := net.ResolveUDPAddr("udp", server.address)
+	udpAddress, err := net.ResolveUDPAddr("udp", server.ip + ":" + strconv.FormatUint(uint64(server.port), 10))
 
 	if err != nil{
 		return fmt.Errorf("[Error] Error resoving address: %v\n", err)
@@ -71,6 +105,8 @@ func (server *Server) CreateQUICConnection() error{
 		return fmt.Errorf("[Error] Error listening on UDP socket: %v\n", err)
 	}
 	
+	keylogWriter, err := os.OpenFile("secrets.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	
 	quicTransport := &quic.Transport{Conn: udpConnection}
 	
 	// set alpn for tls handshake (roq-10) is the standard for roq
@@ -78,12 +114,13 @@ func (server *Server) CreateQUICConnection() error{
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert}, 
 		NextProtos: []string{"roq-10"}, 
-		
+		KeyLogWriter: keylogWriter,
 		// accept client regardless of client cert (for now)
 		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error){
 			return &tls.Config{
 				Certificates: []tls.Certificate{cert}, 
 				NextProtos: []string{"roq-10"},
+				KeyLogWriter: keylogWriter,
 			}, nil
 		},
 	}
@@ -106,7 +143,6 @@ func (server *Server) CreateQUICConnection() error{
 	return nil
 }
 
-// pointer receiver for iniializing server session and flow
 func (server *Server) InitializeServer() error{
 	err := server.CreateQUICConnection()
 	
@@ -135,65 +171,56 @@ func (server *Server) InitializeServer() error{
 	return nil
 }
 
-// pointer receiver for opening video file and streaming
-func (server *Server) SendRTP(vfilepath string) error{
-	// access the video file
-	vfile, err := os.Open(vfilepath)
+func (server *Server) StartStream() error{
+	err := server.InitializeServer()
 	
 	if err != nil{
-		return fmt.Errorf("[Error] Error opening video file: %v\n", err)
+		return fmt.Errorf("[Error] Failed to initialize server: %v\n", err)
 	}
 	
-	fmt.Printf("[Status] Streaming video source %s\n", vfilepath)
+	appSink := app.SinkFromElement(server.sink)
 	
-	// h264 reader 
-	reader, _ := h264reader.NewReader(vfile)
-	
-	ticker := time.NewTicker(33 * time.Millisecond)
-	var samples uint32 = clockRate / 30 
-	
-	//   loop thru all nal units from the reader
-	for{
-		<-ticker.C
-		
-		nal, err := reader.NextNAL()
-		
-		if err != nil{
-			if errors.Is(err, io.EOF){
-				fmt.Println("[Status ] Video ended")
-				break
+	appSink.SetCallbacks(&app.SinkCallbacks{
+		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn{
+			sample := sink.PullSample()
+			
+			if sample == nil{
+				return gst.FlowEOS
 			}
-			return fmt.Errorf("[Error] Error extracting NAL unit: %v\n", err)
-		}
-		
-		//skip empty nal units
-		if nal == nil || len(nal.Data) == 0{
-			continue
-		}
-
-		//packetize nal unit
-		packets := server.packetizer.Packetize(nal.Data, samples)
-		
-		// send packets to roq buffwer
-		for _, packet := range packets{
-			rawb, err := packet.Marshal()
-			_ = err
-			err = server.sendFlow.WriteRTPBytes(rawb)
-		}
-	}
+			
+			buffer := sample.GetBuffer()
+			
+			if buffer == nil{
+				return gst.FlowError
+			}
+			
+			mapinfo := buffer.Map(gst.MapRead)
+			defer buffer.Unmap()
+			err := server.sendFlow.WriteRTPBytes(mapinfo.Bytes())
+			
+			if err != nil{
+				return gst.FlowError
+			}
+			
+			return gst.FlowOK
+		},
+	})
 	
-	fmt.Printf("[Status] Streaming finished.")
-	vfile.Close()
+	server.pipeline.SetState(gst.StatePlaying)
+	mainLoop := glib.NewMainLoop(nil, true)
+	mainLoop.Run()
 	
 	return nil
 }
 
 func (server *Server) CloseServer(){
+	server.pipeline.SetState(gst.StateNull)
 	server.sendFlow.Close()
 	server.quicConnection.CloseWithError(0, "[Status] QUIC connection closed.")
 }
-
 func main(){
+	gst.Init(nil)
+	
 	addr := "127.0.0.1:5000"
 	var vfilepath string
 
@@ -203,20 +230,19 @@ func main(){
 	} else if len(os.Args) > 1 {
 		vfilepath = os.Args[1]
 	}
+	
+	address := strings.Split(addr, ":")
+	ip := address[0]
+	port, _ := strconv.ParseUint(address[1], 10, 64)
 
-	server := CreateServer(addr)
+	server := CreateServer(ip, port)
 	fmt.Println("[Status] Server Created")
 
-	if err := server.InitializeServer(); err != nil{
-		fmt.Printf("[Error] Server initialization failed: %v\n", err)
-		server.CloseServer()
-		os.Exit(1)
-	}
-
-	err := server.SendRTP(vfilepath)
+	server.InitializePipeline(vfilepath)
+	err := server.StartStream()
 	
 	if err != nil{
-		fmt.Printf("[Error] Error sending RTP: %v\n", err)
+		fmt.Printf("[Error] Error streaming video %v\n", err)
 		server.CloseServer()
 		os.Exit(1)
 	}

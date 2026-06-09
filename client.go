@@ -5,32 +5,67 @@ import(
 	"crypto/tls"
 	"context"
 	"net"
-	//"io"
+	"strings"
+	"strconv"
 	"os"
 
 	"github.com/quic-go/quic-go"
 	"github.com/mengelbart/roq"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
+	"github.com/go-gst/go-gst/gst"
+	"github.com/go-gst/go-gst/gst/app"
+	"github.com/go-gst/go-glib/glib"
 )
 
-const flowID uint64 = 1
-var annexBCode = []byte{0x00, 0x00, 0x00, 0x01}
+var flowID uint64 = 1
 
 type Client struct{
-	address string
+	ip 			   string
+	port 		   uint64
 	quicConnection quic.Connection
-	receiveFlow *roq.ReceiveFlow
-	depacketizer rtp.Depacketizer
+	receiveFlow    *roq.ReceiveFlow
+	
+	pipeline 	 *gst.Pipeline
+	source 		 *gst.Element
+	depayloader  *gst.Element
+	parser 		 *gst.Element
+	decoder 	 *gst.Element
+	videoconvert *gst.Element
+	sink 		 *gst.Element
 }
 
-func CreateClient(address string) *Client{
+func CreateClient(ip string, port uint64) *Client{
 	return &Client{
-		address: address,
+		ip: 			ip,
+		port: 			port,
 		quicConnection: nil,
-		receiveFlow: nil,
-		depacketizer: &codecs.H264Packet{},
+		receiveFlow: 	nil,
+		pipeline: 		nil,
+		source: 		nil,
+		depayloader: 	nil,
+		parser: 		nil,
+		decoder: 		nil,
+		videoconvert: 	nil,
+		sink: 			nil,
 	}
+}
+
+func (client *Client) InitializePipeline(){
+	pipeline := fmt.Sprintf(
+		`appsrc name=source format=time caps="application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96" !` +
+		`rtph264depay name=depayloader !` +
+		`h264parse name=parser !` +
+		`avdec_h264 name=decoder !` +
+		`videoconvert !` +
+		`ximagesink name=sink`,
+	)
+
+	client.pipeline, _ = gst.NewPipelineFromString(pipeline)
+
+	client.source, _ 	  = client.pipeline.GetElementByName("source")
+	client.depayloader, _ = client.pipeline.GetElementByName("depayloader")
+	client.parser, _	  = client.pipeline.GetElementByName("parser")
+	client.decoder, _	  = client.pipeline.GetElementByName("decoder")
+	client.sink, _		  = client.pipeline.GetElementByName("sink")
 }
 
 // pointer receiver for initializing QUIC connection
@@ -51,7 +86,7 @@ func (client *Client) CreateQUICConnection() error{
 	tlsConfig := &tls.Config{NextProtos: []string{"roq-10"}, InsecureSkipVerify: true}
 	quicConfig := &quic.Config{EnableDatagrams: true} // configure quic to use quic datagrams
 	
-	serverAddress, err := net.ResolveUDPAddr("udp", client.address)
+	serverAddress, err := net.ResolveUDPAddr("udp", client.ip + ":" + strconv.FormatUint(uint64(client.port), 10))
 
 	if err != nil{
 		return fmt.Errorf("[Error] Error resolving address: %v", err)
@@ -71,6 +106,7 @@ func (client *Client) CreateQUICConnection() error{
 
 
 func (client *Client) InitializeClient() error{
+	client.InitializePipeline()
 	err := client.CreateQUICConnection()
 	
 	if err != nil{
@@ -99,38 +135,49 @@ func (client *Client) InitializeClient() error{
 	return nil
 }
 
-func (client *Client) ReceiveRTP(){
-	buffer := make([]byte, 1500)
+func (client *Client) PlayStream() error{
+	err := client.InitializeClient()
+	
+	if err != nil{
+		return fmt.Errorf("[Error] Error initializing client: %v\n", err)
+	}
 
+	go client.ReceivePackets()
+	client.pipeline.SetState(gst.StatePlaying)	
+	
+	mainLoop := glib.NewMainLoop(nil, true)
+	mainLoop.Run()
+	
+	fmt.Printf("[Status] Streaming finished")
+	
+	return nil
+}
+
+func (client *Client) ReceivePackets(){
+	buffer := make([]byte, 65536)
+	
+	appsource := app.SrcFromElement(client.source)
+	
 	for{
 		size, err := client.receiveFlow.Read(buffer)
 		
 		if err != nil{
-			continue
+			break
 		}
 		
 		if size == 0{
 			continue
 		}
 		
-		packet := &rtp.Packet{}
-		
-		//unmarshal only the actual bytes (0 to size)
-		if err := packet.Unmarshal(buffer[:size]); err != nil{
-			fmt.Printf("[Error] Error unmarshaling RTP: %v\n", err)
-			continue //skip the packet and look for the next one
-		}
+		bytes := make([]byte, size)
+		copy(bytes, buffer[:size])
+		gstbuf := gst.NewBufferFromBytes(bytes)
+		ret := appsource.PushBuffer(gstbuf)
 			
-		nal, err := client.depacketizer.Unmarshal(packet.Payload)
-			
-		if err != nil || len(nal) ==0{
-			continue
+		if ret != gst.FlowOK{
+			break
 		}
-
-		fmt.Printf("[RTP] {pt: %d | seq: %d | ssrc: 0x%X | timestamp: %d | sizeof payload: %d bytes}\n", packet.PayloadType, packet.SequenceNumber, packet.SSRC, packet.Timestamp, len(packet.Payload))
 	}
-	
-	fmt.Printf("[Status] Streaming finished")
 }
 
 func (client *Client) CloseClient(){
@@ -139,20 +186,21 @@ func (client *Client) CloseClient(){
 }
 
 func main() {
+	gst.Init(nil)
 	addr := "127.0.0.1:5000" //default fallback string
 
 	if len(os.Args) > 1 {
 		addr = os.Args[1]
 	}
 
-	client := CreateClient(addr)
-	fmt.Println("[Status] Client Created")
-	
-	if err := client.InitializeClient(); err != nil{
-		fmt.Printf("[Error] Client initialization failed: %v\n", err)
-		os.Exit(1)
-	}
+	address := strings.Split(addr, ":")
+	ip := address[0]
+	port, _ := strconv.ParseUint(address[1], 10, 64)
 
-	client.ReceiveRTP()
+	client := CreateClient(ip, port)
+	fmt.Println("[Status] Client Created")
+
+	_ = client.PlayStream()
+	
 	client.CloseClient()
 }
