@@ -29,15 +29,18 @@ sudo apt-get update
 sudo apt-get install -y mininet wireshark tshark ffmpeg libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gcc pkg-config
 ` ` `
 
-### 2. Go Environment
-* **Go** (v1.18+ recommended)
-* **CGO must be enabled** for the GStreamer Go-bindings to work. 
-` ` `bash
-export CGO_ENABLED=1
-go mod tidy
-` ` `
+### Step 2: Build the Go Binaries
+Because this project utilizes GStreamer's C-libraries, you must explicitly enable CGO (`CGO_ENABLED=1`) during the compilation process. Do not commit these binaries to the repository; always compile fresh versions on your local machine.
 
----
+Run the following commands in your terminal to build the application binaries:
+
+```bash
+# Build the Server App
+CGO_ENABLED=1 go build -o server_app server.go
+
+# Build the Client App
+CGO_ENABLED=1 go build -o client_app client.go
+
 
 ## 📄 Upgraded File Breakdown
 
