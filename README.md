@@ -1,4 +1,6 @@
-# ABROQ: Automated Baseline Evaluation Harness
+# ABROQ: Automated Baseline Evaluation Enhancement
+
+## TLDR: RoQ delivery still works originally as in Tian's Repo, just added enhancements to cater data standardization for QoE Evaluation
 
 This repository contains the upgraded scientific evaluation harness for the Adaptive Bitrate over Real-time Media over QUIC (ABROQ) thesis. 
 
@@ -14,7 +16,7 @@ SHARED_DIR="/mnt/hgfs/THESIS SHARED FOLDER"
 ` ` `
 *(Note: Be sure to remove the spaces between the backticks when you paste this part if your editor adds them!)*
 
-If you do not change this to a valid directory on your system, the script will fail to save the final `.mp4` and `.pcap` files!
+#If you do not change this to a valid directory on your system, the script will fail to save the final `.mp4` and `.pcap` files
 
 ---
 
