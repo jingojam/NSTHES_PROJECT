@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time" // Added to handle the 2-second teardown delay
+	"sync"
 
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
@@ -20,6 +21,40 @@ import (
 
 var flowID uint64 = 1
 
+/*video quality modifiers*/
+type BitrateTier struct{
+	quality	string
+	targetbitrate float64
+	maxbitrate	float64
+	width	int
+	height	int
+}
+
+/*
+	bitrate tiers, and corresponding modifiers
+	(as per the paper)
+*/
+var quality = []BitrateTier{
+	{quality: "480p", targetbitrate: 2000000.0, maxbitrate: 2500000.0, width: 854, height: 480},
+	{quality: "720p", targetbitrate: 4000000.0, maxbitrate: 5000000.0, width: 1280, height: 720},
+	{quality: "1080p", targetbitrate: 8000000.0, maxbitrate: 10000000.0, width: 1920, height: 1080},
+}
+
+
+/*
+	quality[low] = "low" quality
+	quality[mid] = "mid" quality
+	quality[high] = "high" quality
+	
+	these indexes are just helpers to avoid indexing confusion
+*/
+var low int = 0
+var mid int = 1
+var high int = 2
+
+/*
+	Packet implementation for SCReAM
+*/
 type Packet struct{
 	size int
 	sequenceNumber uint16
@@ -42,6 +77,9 @@ func (packet* Packet) Timestamp() time.Time{
 	RTP/QUIC Server
 */
 type Server struct {
+	/*thread safety*/
+	lock sync.RWMutex
+	
 	/*Network attributes*/
 	ip   string
 	port uint64
@@ -57,6 +95,7 @@ type Server struct {
 	/*GStreamer pipeline elements*/
 	pipeline  *gst.Pipeline
 	source    *gst.Element
+	capsfilter	  *gst.Element
 	parser    *gst.Element
 	demux     *gst.Element
 	payloader *gst.Element
@@ -73,6 +112,7 @@ func CreateServer(ip string, port uint64) *Server {
 		sendFlow:       nil,
 		pipeline:       nil,
 		source:         nil,
+		capsfilter:		nil,
 		demux:          nil,
 		parser:         nil,
 		payloader:      nil,
@@ -80,25 +120,87 @@ func CreateServer(ip string, port uint64) *Server {
 	}
 }
 
+/*
+	initialize server-side gstreamer pipeline and elements
+*/
 func (server *Server) InitializePipeline(videoFile string) {
 	pipeline := fmt.Sprintf(
-		`filesrc location=%s name=source !`+
-		`qtdemux name=demux demux.video_0 !`+
-		`queue !`+
-		`h264parse name=parser !`+
-		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 !`+
-		`appsink name=sink sync=true max-buffers=1`, videoFile,
+		`filesrc location=%s name=source ! `+
+		`qtdemux name=demux demux.video_0 ! `+
+		`queue ! `+
+		`h264parse name=parser ! `+
+		`avdec_h264 ! `+
+		`videoscale ! `+
+		`capsfilter name=filter caps=video/x-raw,width=%d,height=%d ! `+
+		`x264enc bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
+		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 ! `+
+		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, int(quality[low].targetbitrate/1000), //video quality initially lowest
 	)
 	
-	server.pipeline, _ = gst.NewPipelineFromString(pipeline)
+	var err error
 	
-	server.source, _    = server.pipeline.GetElementByName("source")
-	server.demux, _     = server.pipeline.GetElementByName("demux")
-	server.parser, _    = server.pipeline.GetElementByName("parser")
-	server.payloader, _ = server.pipeline.GetElementByName("payloader")
-	server.sink, _      = server.pipeline.GetElementByName("sink")
+	server.pipeline, err = gst.NewPipelineFromString(pipeline)
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to create pipeline: %v\n", err)
+	}
+	
+	server.source, err    = server.pipeline.GetElementByName("source")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize source element: %v\n", err)
+	}
+	
+	server.demux, err     = server.pipeline.GetElementByName("demux")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize demux element: %v\n", err)
+	}
+	
+	server.parser, err    = server.pipeline.GetElementByName("parser")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize parser element: %v\n", err)
+	}
+	
+	server.capsfilter, err = server.pipeline.GetElementByName("filter")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize capsfilter element: %v\n", err)
+	}
+	
+	server.payloader, err = server.pipeline.GetElementByName("payloader")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize payloader element: %v\n", err)
+	}
+	
+	server.sink, err      = server.pipeline.GetElementByName("sink")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize sink element: %v\n", err)
+	}
 }
 
+/*
+	updates server's capsfilter element to adjust video quality
+*/
+func (server *Server) AdjustVideoQuality(width int, height int){
+	// obtain a lock in case to prevent race conditions
+	server.lock.Lock()
+	defer server.lock.Unlock()
+	
+	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", width, height))
+	err := server.capsfilter.SetProperty("caps", caps)
+	
+	if err != nil{
+		fmt.Printf("[Error] Error adjusting video quality: %v\n", err)
+	}
+}
+
+/*
+	creates a bease quic connection
+*/
 func (server *Server) CreateQUICConnection() error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -155,6 +257,10 @@ func (server *Server) CreateQUICConnection() error {
 	return nil
 }
 
+/*
+	creates roq connection, session, sender flow 
+	and SCReAM register
+*/
 func (server *Server) InitializeServer() error {
 	err := server.CreateQUICConnection()
 	if err != nil {
@@ -182,6 +288,10 @@ func (server *Server) InitializeServer() error {
 	return nil
 }
 
+/*
+	launches server gstreamer pipeline and scream
+	monitoring
+*/
 func (server *Server) StartStream() error {
 	err := server.InitializeServer()
 	if err != nil {
@@ -216,8 +326,7 @@ func (server *Server) StartStream() error {
 			sequenceNumber := uint16(data[2])<<8 | uint16(data[3])
 			size := len(data)
 			mark := (data[1] & 0x80) != 0 // RTP marker bit
-			//now := time.Now()
-			
+
 			pkt := &Packet{
 				size:           size,
 				sequenceNumber: sequenceNumber,
@@ -249,23 +358,72 @@ func (server *Server) StartStream() error {
 	return nil
 }
 
+/*
+	helper function for computing safe throughput
+*/
+func ComputeSafeThroughput(Traw float64) float64{
+	//alpha = 0.8
+	return Traw * 0.8
+}
+
+/*
+	helper function for deriving video quality tier
+	from current throughput estimation
+
+*/
+func ComputeTier(Tsafe float64) int{
+	if Tsafe >= quality[high].targetbitrate{
+		return high
+	}
+	
+	if Tsafe >= quality[mid].targetbitrate{
+		return mid
+	}
+
+	return low
+}
+
+/*
+	function for receiving RTCP feedback from the client
+*/
 func (server *Server) ReceiveFeedback(){
 	for{
+		//receive a QUIC datagram
 		feedback, err := server.quicConnection.ReceiveDatagram(context.Background())
-		fmt.Printf("[Debug] Feedback bytes: %x\n", feedback[:min(len(feedback), 20)])
+		
 		if err != nil{
 			fmt.Printf("[SCReAM Log] Error receiving RTCP feedback: %v\n", err)
 			return
 		}
 		
-		//now := time.Now()
-		
+		// parse feedback
 		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedback)
 		
 		fmt.Println(server.screamCC.GetStatistics(time.Now()))
 		
-		bitrate := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
-        fmt.Printf("Target bitrate after feedback = %f\n", bitrate)
+		Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
+		
+		if Traw != -1.0{
+			//Rcurrent := 0
+			target := ComputeTier(Traw)
+			fmt.Printf("[ABR] Traw = %.2f bps, Tsafe = %.2f bps, Tier = %s\n", Traw, ComputeSafeThroughput(Traw), quality[target].quality)
+			server.AdjustVideoQuality(quality[target].width, quality[target].height)
+			fmt.Printf("[ABR] Adjusted quality to: %s\n", quality[target].quality)
+			
+			/*
+			go func(server *Server, Traw float64, Rcurrent string){
+				startupPhase := true
+				Tsafe := ComputeSafeThroughput(Traw)
+				Rtarget := ComputeTier(Tsafe)
+				
+				if Rtarget > Rcurrent{
+					server.AdjustVideoQuality(quality[Rtarget].width, quality[Rtarget].height)
+					Rcurrent = Rtarget
+				}
+				
+			}(server, Traw, Rcurrent)
+			*/
+		}
 	}
 }
 

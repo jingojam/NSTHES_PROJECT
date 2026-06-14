@@ -126,12 +126,19 @@ func (client *Client) RunClient(outputFile string) error {
 }
 
 
+/*
+	helper from SCReAM library
+	(currently not exposed in the go packages, you have
+	to manually inspect signatures via cli commands)
+*/
 func toNTP(t time.Time) uint32{
     s := (float64(t.UnixNano()) / 1000000000) + 2208988800
     return uint32(s * 65536)
 }
 
-
+/*
+	for receiving rtp packets
+*/
 func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	buffer := make([]byte, 65536)
 	appsource := app.SrcFromElement(client.source)
