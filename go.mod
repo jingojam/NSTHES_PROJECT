@@ -6,6 +6,7 @@ require (
 	github.com/go-gst/go-glib v1.0.0
 	github.com/go-gst/go-gst v1.0.0
 	github.com/mengelbart/roq v0.3.0
+	github.com/mengelbart/scream-go v0.5.0
 	github.com/quic-go/quic-go v0.47.0
 )
 

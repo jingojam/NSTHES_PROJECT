@@ -25,6 +25,8 @@ github.com/mengelbart/qlog v0.0.0-20240720205814-d54597c9c5fb h1:Sfr+D9MdvZwZ4So
 github.com/mengelbart/qlog v0.0.0-20240720205814-d54597c9c5fb/go.mod h1:VYN6v3lj3QcBxSVllMfDTyVlZkiRmrFXTkH7AGCSnCE=
 github.com/mengelbart/roq v0.3.0 h1:DIZ3CDqCVow+UGWnRwJK6ybTfK/PPS2Xofmd3jXbaCE=
 github.com/mengelbart/roq v0.3.0/go.mod h1:pD3t32WMUZhT/XhGguiTvlfmCiz6OezlES9P2mQAjks=
+github.com/mengelbart/scream-go v0.5.0 h1:E6ur6bicNN9tYrEwzdhvEDKv5odRQnaD1/TKp/oGQWY=
+github.com/mengelbart/scream-go v0.5.0/go.mod h1:5r0YIAaMHmMA6dFSBfLINJPYR7ooVxJwtsigccg6jAg=
 github.com/onsi/ginkgo/v2 v2.9.5 h1:+6Hr4uxzP4XIUyAkg61dWBw8lb/gc4/X5luuxN/EC+Q=
 github.com/onsi/ginkgo/v2 v2.9.5/go.mod h1:tvAoo1QUJwNEU2ITftXTpR7R1RbCzoZUOs3RonqW57k=
 github.com/onsi/gomega v1.27.6 h1:ENqfyGeS5AX/rlXDd/ETokDz93u0YufY1Pgxuy/PvWE=

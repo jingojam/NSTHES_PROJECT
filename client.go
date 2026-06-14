@@ -14,15 +14,20 @@ import (
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/mengelbart/roq"
 	"github.com/quic-go/quic-go"
+	scream "github.com/mengelbart/scream-go"
 )
 
 var flowID uint64 = 1
 
 type Client struct {
+	/*Network attributes*/
 	ip             string
 	port           uint64
 	quicConnection quic.Connection
 	receiveFlow    *roq.ReceiveFlow
+	
+	/*SCReAM congestion controller (feedback)*/
+	screamRx *scream.Rx
 
 	pipeline     *gst.Pipeline
 	source       *gst.Element
@@ -39,6 +44,7 @@ func CreateClient(ip string, port uint64) *Client {
 		port:           port,
 		quicConnection: nil,
 		receiveFlow:    nil,
+		screamRx:		scream.NewRx(1),
 		pipeline:       nil,
 		source:         nil,
 		depayloader:    nil,
@@ -119,12 +125,21 @@ func (client *Client) RunClient(outputFile string) error {
 	return nil
 }
 
-func (client *Client) ReceivePackets(mainLoop *glib.MainLoop) {
+func toNTP(t time.Time) uint32{
+    // NTP epoch is Jan 1 1900; Unix epoch is Jan 1 1970 — 70 years apart
+    const ntpOffset = 2208988800
+    secs  := uint64(t.Unix()) + ntpOffset
+    frac  := uint64(t.Nanosecond()) * 65536 / 1000000000
+    return uint32((secs << 16) | frac)
+}
+
+func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	buffer := make([]byte, 65536)
 	appsource := app.SrcFromElement(client.source)
 
 	for {
 		size, err := client.receiveFlow.Read(buffer)
+		
 		if err != nil {
 			fmt.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
 			break
@@ -136,6 +151,31 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop) {
 
 		bytes := make([]byte, size)
 		copy(bytes, buffer[:size])
+		
+		ntpTime := toNTP(time.Now())
+		ssrc := uint32(buffer[8])<<24 | uint32(buffer[9])<<16 | uint32(buffer[10])<<8 | uint32(buffer[11])
+		sequenceNumber := uint16(buffer[2])<<8 | uint16(buffer[3])
+		ceBits := uint8(0)
+		mark := (buffer[1] & 0x80) != 0
+		
+		// this Receive method needs to be called every time an rtp packet arrives
+		client.screamRx.Receive(ntpTime, ssrc, size, sequenceNumber, ceBits, mark)
+		
+		// if its a feedback, send feedback to the server on rtp over the media quic Connection
+		if client.screamRx.IsFeedback(ntpTime){
+			go func(ntp uint32, mark bool){
+				feedback, flag := client.screamRx.CreateStandardizedFeedback(ntp, mark)
+				
+				if flag{
+					err := client.quicConnection.SendDatagram(feedback)
+					
+					if err != nil{
+						fmt.Printf("\n[SCReAM Log] Error sending RTCP feedback: %v\n", err)
+					}
+				}
+			}(ntpTime, mark)
+		}
+
 		gstbuf := gst.NewBufferFromBytes(bytes)
 		ret := appsource.PushBuffer(gstbuf)
 

@@ -15,9 +15,28 @@ import (
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/mengelbart/roq"
 	"github.com/quic-go/quic-go"
+	scream "github.com/mengelbart/scream-go"
 )
 
 var flowID uint64 = 1
+
+type Packet struct{
+	size int
+	sequenceNumber uint16
+	timestamp time.Time
+}
+
+func (packet* Packet) Size() int{
+	return packet.size
+}
+
+func (packet* Packet) SequenceNumber() uint16{
+	return packet.sequenceNumber
+}
+
+func (packet* Packet) Timestamp() time.Time{
+	return packet.timestamp
+}
 
 /*
 	RTP/QUIC Server
@@ -26,6 +45,10 @@ type Server struct {
 	/*Network attributes*/
 	ip   string
 	port uint64
+	
+	/*SCReAM congestion controller*/
+	screamCC *scream.Tx
+	screamQueue *scream.Queue[*Packet]
 	
 	/*QUIC transport attributes*/
 	quicConnection quic.Connection
@@ -44,6 +67,8 @@ func CreateServer(ip string, port uint64) *Server {
 	return &Server {
 		ip:             ip,
 		port:           port,
+		screamCC:       scream.NewTx(),
+		screamQueue:	scream.NewQueue[*Packet](),
 		quicConnection: nil,
 		sendFlow:       nil,
 		pipeline:       nil,
@@ -149,8 +174,18 @@ func (server *Server) InitializeServer() error {
 		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
 		return fmt.Errorf("[Error] Error establishing send flow: %w", err)
 	}
+	//register for scream
+	server.screamCC.RegisterNewStream(
+		server.screamQueue,
+		1,
+		1.0,
+		1000000,
+		3000000,
+		15000000,
+	)
 	
 	fmt.Println("[Status] Server initialized")
+	
 	return nil
 }
 
@@ -159,6 +194,9 @@ func (server *Server) StartStream() error {
 	if err != nil {
 		return fmt.Errorf("[Error] Failed to initialize server: %v", err)
 	}
+	
+	//create a background thread for listening to feedback from the client
+	go server.ReceiveFeedback()
 	
 	// Create MainLoop prior to callbacks so closure context captures it smoothly
 	mainLoop := glib.NewMainLoop(nil, true)
@@ -181,14 +219,30 @@ func (server *Server) StartStream() error {
 			mapinfo := buffer.Map(gst.MapRead)
 			defer buffer.Unmap()
 			
-			bytesToSend := mapinfo.Bytes()
-			fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(bytesToSend))
+			data:= mapinfo.Bytes()
+			sequenceNumber := uint16(data[2])<<8 | uint16(data[3])
+			size := len(data)
+			mark := (data[1] & 0x80) != 0 // RTP marker bit
+			now := time.Now()
 			
-			err := server.sendFlow.WriteRTPBytes(bytesToSend)
+			server.screamCC.NewMediaFrame(now, 1, size, mark)
+			
+			pkt := &Packet{
+				size:           size,
+				sequenceNumber: sequenceNumber,
+				timestamp:      now,
+			}
+			server.screamQueue.Enqueue(pkt)
+			
+			fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(data))
+			
+			err := server.sendFlow.WriteRTPBytes(data)
 			if err != nil {
 				fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
 				return gst.FlowError
 			}
+		
+			server.screamCC.AddTransmitted(time.Now(), 1, size, sequenceNumber, mark)
 			
 			return gst.FlowOK
 		},
@@ -198,6 +252,21 @@ func (server *Server) StartStream() error {
 	mainLoop.Run()
 	
 	return nil
+}
+
+func (server *Server) ReceiveFeedback(){
+	for{
+		feedback, err := server.quicConnection.ReceiveDatagram(context.Background())
+		
+		if err != nil{
+			fmt.Printf("[SCReAM Log] Error receiving RTCP feedback: %v\n", err)
+			return
+		}
+		
+		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedback)
+		
+		fmt.Println(server.screamCC.GetStatistics(time.Now()))
+	}
 }
 
 func (server *Server) CloseServer() {

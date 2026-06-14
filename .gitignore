@@ -11,3 +11,5 @@ secrets.txt
 *.ts
 *.mp4
 *.pcap
+
+refs/
