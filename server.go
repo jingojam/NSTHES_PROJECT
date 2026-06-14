@@ -217,7 +217,6 @@ func (server *Server) StartStream() error {
 			size := len(data)
 			mark := (data[1] & 0x80) != 0 // RTP marker bit
 			//now := time.Now()
-			//ssrc := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])			
 			
 			pkt := &Packet{
 				size:           size,
@@ -225,9 +224,8 @@ func (server *Server) StartStream() error {
 				timestamp:      time.Now(),
 			}
 			
-			if mark{
-				server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
-			}
+			server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
+			server.screamCC.IsOkToTransmit(time.Now(), 12345678)
 			//fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(data))
 			
 			server.screamQueue.Enqueue(pkt)
@@ -254,7 +252,7 @@ func (server *Server) StartStream() error {
 func (server *Server) ReceiveFeedback(){
 	for{
 		feedback, err := server.quicConnection.ReceiveDatagram(context.Background())
-		
+		fmt.Printf("[Debug] Feedback bytes: %x\n", feedback[:min(len(feedback), 20)])
 		if err != nil{
 			fmt.Printf("[SCReAM Log] Error receiving RTCP feedback: %v\n", err)
 			return
@@ -267,7 +265,7 @@ func (server *Server) ReceiveFeedback(){
 		fmt.Println(server.screamCC.GetStatistics(time.Now()))
 		
 		bitrate := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
-        fmt.Printf("[Debug] target bitrate after feedback = %f\n", bitrate)
+        fmt.Printf("Target bitrate after feedback = %f\n", bitrate)
 	}
 }
 
