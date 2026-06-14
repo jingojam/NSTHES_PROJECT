@@ -49,7 +49,7 @@ type Server struct {
 	/*SCReAM congestion controller*/
 	screamCC *scream.Tx
 	screamQueue *scream.Queue[*Packet]
-	
+
 	/*QUIC transport attributes*/
 	quicConnection quic.Connection
 	sendFlow       *roq.SendFlow
@@ -86,7 +86,7 @@ func (server *Server) InitializePipeline(videoFile string) {
 		`qtdemux name=demux demux.video_0 !`+
 		`queue !`+
 		`h264parse name=parser !`+
-		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 !`+
+		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 !`+
 		`appsink name=sink sync=true max-buffers=1`, videoFile,
 	)
 	
@@ -174,15 +174,8 @@ func (server *Server) InitializeServer() error {
 		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
 		return fmt.Errorf("[Error] Error establishing send flow: %w", err)
 	}
-	//register for scream
-	server.screamCC.RegisterNewStream(
-		server.screamQueue,
-		1,
-		1.0,
-		1000000,
-		3000000,
-		15000000,
-	)
+	
+	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, 100000, 50000000, 50000000)
 	
 	fmt.Println("[Status] Server initialized")
 	
@@ -223,18 +216,21 @@ func (server *Server) StartStream() error {
 			sequenceNumber := uint16(data[2])<<8 | uint16(data[3])
 			size := len(data)
 			mark := (data[1] & 0x80) != 0 // RTP marker bit
-			now := time.Now()
-			
-			server.screamCC.NewMediaFrame(now, 1, size, mark)
+			//now := time.Now()
+			//ssrc := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])			
 			
 			pkt := &Packet{
 				size:           size,
 				sequenceNumber: sequenceNumber,
-				timestamp:      now,
+				timestamp:      time.Now(),
 			}
-			server.screamQueue.Enqueue(pkt)
 			
-			fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(data))
+			if mark{
+				server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
+			}
+			//fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(data))
+			
+			server.screamQueue.Enqueue(pkt)
 			
 			err := server.sendFlow.WriteRTPBytes(data)
 			if err != nil {
@@ -242,7 +238,8 @@ func (server *Server) StartStream() error {
 				return gst.FlowError
 			}
 		
-			server.screamCC.AddTransmitted(time.Now(), 1, size, sequenceNumber, mark)
+			server.screamQueue.Dequeue()
+			server.screamCC.AddTransmitted(time.Now(), 12345678, size, sequenceNumber, mark)
 			
 			return gst.FlowOK
 		},
@@ -263,9 +260,14 @@ func (server *Server) ReceiveFeedback(){
 			return
 		}
 		
+		//now := time.Now()
+		
 		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedback)
 		
 		fmt.Println(server.screamCC.GetStatistics(time.Now()))
+		
+		bitrate := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
+        fmt.Printf("[Debug] target bitrate after feedback = %f\n", bitrate)
 	}
 }
 

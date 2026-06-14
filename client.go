@@ -44,7 +44,7 @@ func CreateClient(ip string, port uint64) *Client {
 		port:           port,
 		quicConnection: nil,
 		receiveFlow:    nil,
-		screamRx:		scream.NewRx(1),
+		screamRx:		scream.NewRx(12345678),
 		pipeline:       nil,
 		source:         nil,
 		depayloader:    nil,
@@ -125,13 +125,12 @@ func (client *Client) RunClient(outputFile string) error {
 	return nil
 }
 
+
 func toNTP(t time.Time) uint32{
-    // NTP epoch is Jan 1 1900; Unix epoch is Jan 1 1970 — 70 years apart
-    const ntpOffset = 2208988800
-    secs  := uint64(t.Unix()) + ntpOffset
-    frac  := uint64(t.Nanosecond()) * 65536 / 1000000000
-    return uint32((secs << 16) | frac)
+    s := (float64(t.UnixNano()) / 1000000000) + 2208988800
+    return uint32(s * 65536)
 }
+
 
 func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	buffer := make([]byte, 65536)
@@ -152,19 +151,18 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 		bytes := make([]byte, size)
 		copy(bytes, buffer[:size])
 		
-		ntpTime := toNTP(time.Now())
+		//ntpTime := toNTP(time.Now())
 		ssrc := uint32(buffer[8])<<24 | uint32(buffer[9])<<16 | uint32(buffer[10])<<8 | uint32(buffer[11])
 		sequenceNumber := uint16(buffer[2])<<8 | uint16(buffer[3])
 		ceBits := uint8(0)
 		mark := (buffer[1] & 0x80) != 0
-		
+
 		// this Receive method needs to be called every time an rtp packet arrives
-		client.screamRx.Receive(ntpTime, ssrc, size, sequenceNumber, ceBits, mark)
+		client.screamRx.Receive(toNTP(time.Now()), ssrc, size, sequenceNumber, ceBits, mark)
 		
 		// if its a feedback, send feedback to the server on rtp over the media quic Connection
-		if client.screamRx.IsFeedback(ntpTime){
-			go func(ntp uint32, mark bool){
-				feedback, flag := client.screamRx.CreateStandardizedFeedback(ntp, mark)
+		if client.screamRx.IsFeedback(toNTP(time.Now())){
+				feedback, flag := client.screamRx.CreateStandardizedFeedback(toNTP(time.Now()), mark)
 				
 				if flag{
 					err := client.quicConnection.SendDatagram(feedback)
@@ -173,7 +171,6 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 						fmt.Printf("\n[SCReAM Log] Error sending RTCP feedback: %v\n", err)
 					}
 				}
-			}(ntpTime, mark)
 		}
 
 		gstbuf := gst.NewBufferFromBytes(bytes)
