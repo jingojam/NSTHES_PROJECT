@@ -445,6 +445,7 @@ func (server *Server) ABR(){
 		//3) set the target to the safe bitrate
 		Rtarget := ComputeTier(Tsafe)
 
+		// scenario A
 		if Rtarget > server.Rcurrent{
 			if server.isStartup{
 				fmt.Printf("[%s] [ABR] Fast-start phase: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
@@ -462,11 +463,20 @@ func (server *Server) ABR(){
 					server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
 				}
 			}
-		} else if Rtarget < server.Rcurrent{
+		} else if Rtarget < server.Rcurrent{ // scenario B
 			fmt.Printf("[%s] [ABR] Downgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
 			server.Rcurrent = Rtarget
 			server.AdjustVideoQuality(Rtarget)
 			server.isStartup = false
+		} else{ //scenario C
+			if server.upgradeTimer != nil{
+				fmt.Printf("[%s] [ABR] Upgrade timer reset \n", time.Now())
+				server.upgradeTimer = nil
+			}
+			
+			if server.Rcurrent == high{
+				server.isStartup = false
+			}
 		}
 	}
 }
