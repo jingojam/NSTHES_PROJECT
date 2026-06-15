@@ -450,17 +450,23 @@ func (server *Server) ABR(){
 				fmt.Printf("[%s] [ABR] Fast-start phase: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
 				server.Rcurrent = Rtarget
 				server.AdjustVideoQuality(Rtarget)
-				server.isStartup = false
 			} else{
-				upgrade := func(){
-					fmt.Printf("[%s] [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
-					server.Rcurrent = Rtarget
-					server.AdjustVideoQuality(Rtarget)
-					server.upgradeTimer = nil
-				}
+				if server.upgradeTimer == nil{
+					upgrade := func(){
+						fmt.Printf("[%s] [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+						server.Rcurrent = Rtarget
+						server.AdjustVideoQuality(Rtarget)
+						server.upgradeTimer = nil
+					}
 				
-				server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
+					server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
+				}
 			}
+		} else if Rtarget < server.Rcurrent{
+			fmt.Printf("[%s] [ABR] Downgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+			server.Rcurrent = Rtarget
+			server.AdjustVideoQuality(Rtarget)
+			server.isStartup = false
 		}
 	}
 }
