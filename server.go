@@ -96,6 +96,7 @@ type Server struct {
 	pipeline  *gst.Pipeline
 	source    *gst.Element
 	capsfilter	  *gst.Element
+	encoder	  *gst.Element
 	parser    *gst.Element
 	demux     *gst.Element
 	payloader *gst.Element
@@ -113,6 +114,7 @@ func CreateServer(ip string, port uint64) *Server {
 		pipeline:       nil,
 		source:         nil,
 		capsfilter:		nil,
+		encoder:		nil,
 		demux:          nil,
 		parser:         nil,
 		payloader:      nil,
@@ -132,9 +134,9 @@ func (server *Server) InitializePipeline(videoFile string) {
 		`avdec_h264 ! `+
 		`videoscale ! `+
 		`capsfilter name=filter caps=video/x-raw,width=%d,height=%d ! `+
-		`x264enc bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
+		`x264enc name=encoder bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
 		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 ! `+
-		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, int(quality[low].targetbitrate/1000), //video quality initially lowest
+		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, uint32(quality[low].targetbitrate/1000), //video quality initially lowest
 	)
 	
 	var err error
@@ -169,6 +171,12 @@ func (server *Server) InitializePipeline(videoFile string) {
 		fmt.Printf("[Error] Failed to initialize capsfilter element: %v\n", err)
 	}
 	
+	server.encoder, err = server.pipeline.GetElementByName("encoder")
+	
+	if err != nil{
+		fmt.Printf("[Error] Failed to initialize encoder element: %v\n", err)
+	}
+	
 	server.payloader, err = server.pipeline.GetElementByName("payloader")
 	
 	if err != nil{
@@ -185,17 +193,27 @@ func (server *Server) InitializePipeline(videoFile string) {
 /*
 	updates server's capsfilter element to adjust video quality
 */
-func (server *Server) AdjustVideoQuality(width int, height int){
+func (server *Server) AdjustVideoQuality(tier int){
 	// obtain a lock in case to prevent race conditions
 	server.lock.Lock()
 	defer server.lock.Unlock()
 	
-	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", width, height))
+	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", quality[tier].width, quality[tier].height))
 	err := server.capsfilter.SetProperty("caps", caps)
 	
 	if err != nil{
 		fmt.Printf("[Error] Error adjusting video quality: %v\n", err)
+		return
 	}
+	
+	err = server.encoder.SetProperty("bitrate", uint(quality[tier].targetbitrate/1000))
+	
+	if err != nil{
+		fmt.Printf("[Error] Error adjusting encoder: %v\n", err)
+		return
+	}
+	
+	fmt.Printf("[ABR] Adjusted quality to: %s\n", quality[tier].quality)
 }
 
 /*
@@ -405,10 +423,10 @@ func (server *Server) ReceiveFeedback(){
 		
 		if Traw != -1.0{
 			//Rcurrent := 0
-			target := ComputeTier(Traw)
+			Tsafe := ComputeSafeThroughput(Traw)
+			target := ComputeTier(Tsafe)
 			fmt.Printf("[ABR] Traw = %.2f bps, Tsafe = %.2f bps, Tier = %s\n", Traw, ComputeSafeThroughput(Traw), quality[target].quality)
-			server.AdjustVideoQuality(quality[target].width, quality[target].height)
-			fmt.Printf("[ABR] Adjusted quality to: %s\n", quality[target].quality)
+			server.AdjustVideoQuality(target)
 			
 			/*
 			go func(server *Server, Traw float64, Rcurrent string){
