@@ -78,7 +78,7 @@ func (packet* Packet) Timestamp() time.Time{
 */
 type Server struct {
 	/*thread safety*/
-	lock sync.RWMutex
+	qPipeLock sync.RWMutex
 	
 	/*Network attributes*/
 	ip   string
@@ -87,6 +87,11 @@ type Server struct {
 	/*SCReAM congestion controller*/
 	screamCC *scream.Tx
 	screamQueue *scream.Queue[*Packet]
+	
+	/*ABR variables*/
+	isStartup	  bool
+	Rcurrent	  int
+	upgradeTimer *time.Timer
 
 	/*QUIC transport attributes*/
 	quicConnection quic.Connection
@@ -109,6 +114,8 @@ func CreateServer(ip string, port uint64) *Server {
 		port:           port,
 		screamCC:       scream.NewTx(),
 		screamQueue:	scream.NewQueue[*Packet](),
+		isStartup:		true,
+		Rcurrent:		low,
 		quicConnection: nil,
 		sendFlow:       nil,
 		pipeline:       nil,
@@ -136,7 +143,7 @@ func (server *Server) InitializePipeline(videoFile string) {
 		`capsfilter name=filter caps=video/x-raw,width=%d,height=%d ! `+
 		`x264enc name=encoder bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
 		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 ! `+
-		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, uint32(quality[low].targetbitrate/1000), //video quality initially lowest
+		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, uint(quality[low].targetbitrate/1000), //video quality initially lowest
 	)
 	
 	var err error
@@ -194,9 +201,9 @@ func (server *Server) InitializePipeline(videoFile string) {
 	updates server's capsfilter element to adjust video quality
 */
 func (server *Server) AdjustVideoQuality(tier int){
-	// obtain a lock in case to prevent race conditions
-	server.lock.Lock()
-	defer server.lock.Unlock()
+	// obtain a WRITE lock in case to prevent race conditions
+	server.qPipeLock.Lock()
+	defer server.qPipeLock.Unlock()
 	
 	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", quality[tier].width, quality[tier].height))
 	err := server.capsfilter.SetProperty("caps", caps)
@@ -213,7 +220,7 @@ func (server *Server) AdjustVideoQuality(tier int){
 		return
 	}
 	
-	fmt.Printf("[ABR] Adjusted quality to: %s\n", quality[tier].quality)
+	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n", time.Now(), quality[tier].quality)
 }
 
 /*
@@ -353,7 +360,6 @@ func (server *Server) StartStream() error {
 			
 			server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
 			server.screamCC.IsOkToTransmit(time.Now(), 12345678)
-			//fmt.Printf("[Server Log] Pushing RTP packet to RoQ flow, size: %d bytes\n", len(data))
 			
 			server.screamQueue.Enqueue(pkt)
 			
@@ -377,31 +383,6 @@ func (server *Server) StartStream() error {
 }
 
 /*
-	helper function for computing safe throughput
-*/
-func ComputeSafeThroughput(Traw float64) float64{
-	//alpha = 0.8
-	return Traw * 0.8
-}
-
-/*
-	helper function for deriving video quality tier
-	from current throughput estimation
-
-*/
-func ComputeTier(Tsafe float64) int{
-	if Tsafe >= quality[high].targetbitrate{
-		return high
-	}
-	
-	if Tsafe >= quality[mid].targetbitrate{
-		return mid
-	}
-
-	return low
-}
-
-/*
 	function for receiving RTCP feedback from the client
 */
 func (server *Server) ReceiveFeedback(){
@@ -417,30 +398,69 @@ func (server *Server) ReceiveFeedback(){
 		// parse feedback
 		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedback)
 		
-		fmt.Println(server.screamCC.GetStatistics(time.Now()))
+		//fmt.Println(server.screamCC.GetStatistics(time.Now()))
 		
-		Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
+		server.ABR()
+	}
+}
+
+/*
+	helper function for computing safe throughput
+*/
+func ComputeSafeThroughput(Traw float64) float64{
+	//alpha = 0.8
+	return Traw * 0.8
+}
+
+/*
+	helper function for deriving video quality tier
+	from current throughput estimation
+
+*/
+func ComputeTier(q float64) int{
+	if q >= quality[high].targetbitrate{
+		return high
+	}
+	
+	if q >= quality[mid].targetbitrate{
+		return mid
+	}
+
+	return low
+}
+
+/*
+	this is the main ABR loop
+*/
+func (server *Server) ABR(){
+	// 1) obtain the raw estimations from SCReAM
+	Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
+	
+	if Traw != -1.0{ // -1.0 signifies a drop, so ignore it
+		fmt.Printf("[%s] [ABR] Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n", time.Now(), quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
+		//2) apply a safety multiplier to the target
+		Tsafe := ComputeSafeThroughput(Traw)
+		//Bcurrent (buffer occupancy)
 		
-		if Traw != -1.0{
-			//Rcurrent := 0
-			Tsafe := ComputeSafeThroughput(Traw)
-			target := ComputeTier(Tsafe)
-			fmt.Printf("[ABR] Traw = %.2f bps, Tsafe = %.2f bps, Tier = %s\n", Traw, ComputeSafeThroughput(Traw), quality[target].quality)
-			server.AdjustVideoQuality(target)
-			
-			/*
-			go func(server *Server, Traw float64, Rcurrent string){
-				startupPhase := true
-				Tsafe := ComputeSafeThroughput(Traw)
-				Rtarget := ComputeTier(Tsafe)
-				
-				if Rtarget > Rcurrent{
-					server.AdjustVideoQuality(quality[Rtarget].width, quality[Rtarget].height)
-					Rcurrent = Rtarget
+		//3) set the target to the safe bitrate
+		Rtarget := ComputeTier(Tsafe)
+
+		if Rtarget > server.Rcurrent{
+			if server.isStartup{
+				fmt.Printf("[%s] [ABR] Fast-start phase: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+				server.Rcurrent = Rtarget
+				server.AdjustVideoQuality(Rtarget)
+				server.isStartup = false
+			} else{
+				upgrade := func(){
+					fmt.Printf("[%s] [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+					server.Rcurrent = Rtarget
+					server.AdjustVideoQuality(Rtarget)
+					server.upgradeTimer = nil
 				}
 				
-			}(server, Traw, Rcurrent)
-			*/
+				server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
+			}
 		}
 	}
 }
