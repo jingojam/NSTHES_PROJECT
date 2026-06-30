@@ -19,6 +19,10 @@ import (
 
 var flowID uint64 = 1
 
+var currentCapacityUsed uint64 = 0
+
+
+
 type Client struct {
 	/*Network attributes*/
 	ip             string
@@ -113,6 +117,23 @@ func (client *Client) RunClient(outputFile string) error {
 
 	mainLoop := glib.NewMainLoop(nil, false)
 
+	/*
+	client.pipeline.GetPipelineBus().AddWatch(func(msg *gst.Message) bool {
+		switch msg.Type() {
+		case gst.MessageAsyncDone:
+
+		case gst.MessageEOS:
+			fmt.Println("End of Stream reached.")
+			client.pipeline.BlockSetState(gst.StateNull)
+			mainLoop.Quit()
+		case gst.MessageError:
+			err := msg.ParseError()
+			fmt.Println("Error: ", err.Error())
+			mainLoop.Quit()
+		}
+		return true
+	})*/
+
 	// Spin up goroutine to feed incoming QUIC packets to GStreamer appsrc
 	go client.ReceivePackets(mainLoop)
 
@@ -142,6 +163,7 @@ func toNTP(t time.Time) uint32{
 func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	buffer := make([]byte, 65536)
 	appsource := app.SrcFromElement(client.source)
+	videodata := []byte{}
 
 	for {
 		size, err := client.receiveFlow.Read(buffer)
@@ -159,10 +181,13 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 		copy(bytes, buffer[:size])
 		
 		//ntpTime := toNTP(time.Now())
+		
+
 		ssrc := uint32(buffer[8])<<24 | uint32(buffer[9])<<16 | uint32(buffer[10])<<8 | uint32(buffer[11])
 		sequenceNumber := uint16(buffer[2])<<8 | uint16(buffer[3])
 		ceBits := uint8(0)
 		mark := (buffer[1] & 0x80) != 0
+
 
 		// this Receive method needs to be called every time an rtp packet arrives
 		client.screamRx.Receive(toNTP(time.Now()), ssrc, size, sequenceNumber, ceBits, mark)
@@ -180,12 +205,31 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 				}
 		}
 
-		gstbuf := gst.NewBufferFromBytes(bytes)
-		ret := appsource.PushBuffer(gstbuf)
+		//New addition
+		videodata = append(videodata, bytes...) 
 
-		if ret != gst.FlowOK {
-			break
+
+		//Stream video data 
+		if len(videodata) >= 1_250_000 && len(videodata) <= 3_750_000 {
+		
+			gstbuf := gst.NewBufferFromBytes(videodata)
+			fmt.Println("size: ", len(videodata))
+			ret := appsource.PushBuffer(gstbuf)
+
+			if ret != gst.FlowOK {
+				break
+			}
+
+		} else if len(videodata) > 3_750_000 {
+			fmt.Printf("[Client Log] Buffer capacity exceeded, requesting server to slow down...\n")
+
+			err := client.quicConnection.SendDatagram([]byte("SLOW_DOWN"))
+
+			if err != nil { fmt.Printf("Error: %s\n", err) }
 		}
+		//////////////////////////////////////////
+
+		
 	}
 
 	appsource.EndStream()

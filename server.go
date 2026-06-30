@@ -325,6 +325,7 @@ func (server *Server) StartStream() error {
 	
 	//create a background thread for listening to feedback from the client
 	go server.ReceiveFeedback()
+	//go server.ClientBufferTracker()
 	
 	// Create MainLoop prior to callbacks so closure context captures it smoothly
 	mainLoop := glib.NewMainLoop(nil, true)
@@ -391,11 +392,16 @@ func (server *Server) ReceiveFeedback(){
 		feedback, err := server.quicConnection.ReceiveDatagram(context.Background())
 		
 		if err != nil{
-			fmt.Printf("[SCReAM Log] Error receiving RTCP feedback: %v\n", err)
+			fmt.Printf("[QUIC Log] Error receiving RTCP feedback: %v\n", err)
 			return
 		}
 		
 		// parse feedback
+
+		if string(feedback) == "SLOW_DOWN"{
+			fmt.Println("Slow Down")
+		}
+
 		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedback)
 		
 		//fmt.Println(server.screamCC.GetStatistics(time.Now()))
