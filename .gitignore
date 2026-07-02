@@ -1,0 +1,15 @@
+# Compiled Binaries
+client_app
+server_app
+*.exe
+*-compressed
+
+# Local Configuration / Environment
+secrets.txt
+
+# Experiment Artifacts / Media Output
+*.ts
+*.mp4
+*.pcap
+
+refs/

@@ -1,29 +1,101 @@
-# NSTHES_PROJECT
+# ABROQ: Automated Baseline Evaluation Harness
 
-** System Dependencies **
-- OS: Ubuntu 24.04.3 LTS (VMWare)
+# TLDR: RoQ delivery remains unchanged from Tian's Version, just added enhancements to correctly automate, parse, and standardize video output for QoE Evaluation
 
-** Additional Dependencies **
-- Make sure you have configured git in your VM for pull/push access rights to repos
+This repository contains the upgraded scientific evaluation harness for the Adaptive Bitrate over Real-time Media over QUIC (ABROQ) thesis. 
 
-** Guide **
-Execute these commands in a terminal (in order):
+The original codebase provided a basic proof-of-concept for RoQ. This upgraded version transforms it into an automated, highly synchronized test environment capable of safely logging TLS traffic, capturing raw network streams without UI overhead, and perfectly formatting video outputs for FFMetrics VMAF/SSIM analysis.
 
-0) `cd $HOME` -> this is generally `/home/<user>`, to check: `echo $HOME`
-1) `git clone https://github.com/jingojam/NSTHES_PROJECT`
-2) `cd NSTHES_PROJECT/`
-3) `cp conf.sh roq_receiver.sh roq_sender.sh $HOME` -> make sure to copy these 3 files in your `$HOME` directory
-4) `cd $HOME`
-5) `chmod +x conf.sh`
-6) `./conf.sh` -> this may take a while
+## ⚠️ IMPORTANT SETUP REMINDERS
+Before running the experiments on your local VM, you **must** update the shared directory path in the bash scripts. 
 
-** Ensure builds are successful: use these commands: **
-1) `gst-inspect-1.0 rtp` -> should output RTP plugins
-2) `gst-inspect-1.0 quinn` -> should output quinn (RoQ) plugins (e.g., quinnquicdemux/mux, quinnroqdemux/mux)
+Open `run_experiment.sh` and locate **Line 26**:
+` ` `bash
+# CHANGE THIS PATH TO MATCH YOUR MACHINE'S SHARED FOLDER OR LOCAL DIRECTORY
+SHARED_DIR="/mnt/hgfs/THESIS SHARED FOLDER" 
+` ` `
+*(Note: Be sure to remove the spaces between the backticks when you paste this part if your editor adds them!)*
 
-** To test output **
-1) Open two terminals
-2) In terminal A: `./roq_receiver.sh` -> receiver must be run first
-3) In terminal B: `./roq_sender.sh` 
-4) Optionally: you can run `sudo wireshark` in another terminal to sniff
-QUIC packets (filter it to QUIC)
+If you do not change this to a valid directory on your system, the script will fail to save the final `.mp4` and `.pcap` files!
+
+---
+
+## 📦 Dependencies
+To run this suite, your machine must have the following installed:
+
+### 1. System Packages (Ubuntu/Debian)
+` ` `bash
+sudo apt-get update
+sudo apt-get install -y mininet wireshark tshark ffmpeg libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gcc pkg-config
+` ` `
+
+### 2. Go Environment
+* **Go** (v1.18+ recommended)
+* **CGO must be enabled** for the GStreamer Go-bindings to work. 
+` ` `bash
+export CGO_ENABLED=1
+go mod tidy
+` ` `
+
+---
+
+## 📄 Upgraded File Breakdown
+
+### `server.go`
+The RoQ server has been upgraded to properly emulate a live media server.
+* **Media Pacing (`sync=true`):** The GStreamer `appsink` now respects presentation timestamps, forcing the server to send data at exactly 30fps instead of dumping the file instantly and overflowing network buffers.
+* **TLS Keylogging:** Automatically exports the QUIC TLS 1.3 session keys to `secrets.txt`. This allows `tshark` to decrypt the payload and accurately track dropped packets.
+
+### `client.go`
+The RoQ client has been upgraded for headless execution and raw data capture.
+* **Tee Pipeline:** Replaced the simple screen output with a split pipeline. It now drops network bytes directly to a raw `output.ts` file for lossless metrics analysis, while optionally playing the video on screen (with a `leaky` queue so UI lag doesn't ruin the recorded file).
+* **Headless Toggle:** Contains a `headlessMode` boolean. Set to `true` to disable the video popup entirely to save VM CPU resources during heavy testing.
+* **Graceful Teardown:** Detects when the server stops sending data, waits 2 seconds, and automatically closes the application.
+
+### `run_experiment.sh`
+The automation orchestrator. This script manages the entire Mininet lifecycle.
+* Dynamically locates the Mininet `h1` and `h2` processes.
+* Launches the server and client inside the correct virtual nodes.
+* Triggers the specified network condition script (`optimal_network.sh`, `middle_network.sh`, etc.).
+* Polls the client to wait for a graceful exit.
+* **FFmpeg Post-Processing:** Automatically extracts the raw `.ts` file, pads any missing frames caused by network packet drops using the `tpad` filter, and forces exactly 1800 frames into an `.mp4` container for perfect FFMetrics synchronization.
+
+---
+
+## 🚀 How to Run the Experiments
+
+### Step 1: Start Mininet
+Open a terminal and start your Mininet topology. Leave this terminal running.
+` ` `bash
+sudo mn --topo=single,2 --mac --controller=none
+` ` `
+
+### Step 2: Build the Go Binaries
+Because this project utilizes GStreamer's C-libraries, you must explicitly enable CGO (`CGO_ENABLED=1`) during the compilation process. Do not commit these binaries to the repository; always compile fresh versions on your local machine.
+
+Run the following commands in your terminal to build the application binaries:
+
+```bash
+# Build the Server App
+CGO_ENABLED=1 go build -o server_app server.go
+
+# Build the Client App
+CGO_ENABLED=1 go build -o client_app client.go
+
+### Step 3: Run the Automation Script
+Execute the script using `sudo`, passing the desired network scenario and your standardized Baseline profile reference video.
+
+**Syntax:**
+`sudo ./run_experiment.sh <scenario> <video_file>`
+
+**Examples:**
+` ` `bash
+sudo ./run_experiment.sh optimal ./elephant_baseline_5mbps.mp4
+sudo ./run_experiment.sh middle ./elephant_baseline_5mbps.mp4
+sudo ./run_experiment.sh suboptimal ./elephant_baseline_5mbps.mp4
+` ` `
+
+### Step 4: Check Your Output
+Once the terminal reads `EXPERIMENT COMPLETE`, navigate to your defined `SHARED_DIR`. You will find:
+1.  **`received_<scenario>.mp4`**: The padded, synchronized video ready for FFMetrics.
+2.  **`<scenario>_log.pcap`**: The full network packet capture (with `secrets.txt` available in the root folder for decryption).
