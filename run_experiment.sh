@@ -37,9 +37,9 @@ FINAL_MP4="$SHARED_DIR/received_${SCENARIO}.mp4"
 # Clean up any leftover staging file from previous attempts
 rm -f "$RAW_TS"
 
-# 3. Launch the Server on h1 (Background)
+# 3. Launch the Server on h1 (Background) with GStreamer Debugging Enabled
 echo "[Executing] Launching Server on h1..."
-sudo mnexec -a $H1_PID ./server_app 10.0.0.1:5000 "$VIDEO_FILE" > /tmp/server_execution.log 2>&1 &
+sudo mnexec -a $H1_PID env GST_DEBUG=3 ./server_app 10.0.0.1:5000 "$VIDEO_FILE" > /tmp/server_execution.log 2>&1 &
 SERVER_PROC_PID=$!
 
 sleep 2
@@ -79,14 +79,15 @@ sleep 1
 echo "[Cleanup] Stream fully captured! Stopping server..."
 sudo pkill -f "server_app"
 
-# 8. Post-Processing: TS Timestamp Preservation & Exact Frame Padding
-echo "[Processing] Aligning TS container and forcing exact 1800-frame output..."
+# 8. Post-Processing: TS Timestamp Preservation, Scaling, & Exact Frame Padding
+echo "[Processing] Aligning TS container, scaling to 1080p, and forcing exact 1800-frame output..."
 
 # 1. We use fps=30 to lock internal timestamps and freeze-frame any network drops.
-# 2. We use tpad with 'stop=-1' to guarantee a massive tail of cloned frames.
-# 3. We use -frames:v 1800 to perfectly slice the padded video at exactly 1800 frames.
+# 2. We use scale=1920:1080 to up-sample the raw network video to 1080p for VMAF compatibility.
+# 3. We use tpad with 'stop=-1' to guarantee a massive tail of cloned frames.
+# 4. We use -frames:v 1800 to perfectly slice the padded video at exactly 1800 frames.
 ffmpeg -y -i "$RAW_TS" \
-  -filter_complex "[0:v]fps=30:round=near,tpad=stop=-1:stop_mode=clone" \
+  -filter_complex "[0:v]fps=30:round=near,scale=1920:1080,tpad=stop=-1:stop_mode=clone" \
   -frames:v 1800 \
   -c:v libx264 -crf 0 -preset ultrafast "$FINAL_MP4"
 
