@@ -1,101 +1,151 @@
-# ABROQ: Automated Baseline Evaluation Harness
+# RoQ (RTP over QUIC) Video Streaming Engine
 
-# TLDR: RoQ delivery remains unchanged from Tian's Version, just added enhancements to correctly automate, parse, and standardize video output for QoE Evaluation
-
-This repository contains the upgraded scientific evaluation harness for the Adaptive Bitrate over Real-time Media over QUIC (ABROQ) thesis. 
-
-The original codebase provided a basic proof-of-concept for RoQ. This upgraded version transforms it into an automated, highly synchronized test environment capable of safely logging TLS traffic, capturing raw network streams without UI overhead, and perfectly formatting video outputs for FFMetrics VMAF/SSIM analysis.
-
-## ⚠️ IMPORTANT SETUP REMINDERS
-Before running the experiments on your local VM, you **must** update the shared directory path in the bash scripts. 
-
-Open `run_experiment.sh` and locate **Line 26**:
-` ` `bash
-# CHANGE THIS PATH TO MATCH YOUR MACHINE'S SHARED FOLDER OR LOCAL DIRECTORY
-SHARED_DIR="/mnt/hgfs/THESIS SHARED FOLDER" 
-` ` `
-*(Note: Be sure to remove the spaces between the backticks when you paste this part if your editor adds them!)*
-
-If you do not change this to a valid directory on your system, the script will fail to save the final `.mp4` and `.pcap` files!
+An adaptive bitrate (ABR) video streaming system built in **Go** that transports RTP packets over QUIC Datagrams (`roq-10` protocol) using **GStreamer** for media encoding/decoding and **SCReAM** for network congestion control and telemetry.
 
 ---
 
-## 📦 Dependencies
-To run this suite, your machine must have the following installed:
+## Architecture Overview
 
-### 1. System Packages (Ubuntu/Debian)
-` ` `bash
-sudo apt-get update
-sudo apt-get install -y mininet wireshark tshark ffmpeg libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gcc pkg-config
-` ` `
-
-### 2. Go Environment
-* **Go** (v1.18+ recommended)
-* **CGO must be enabled** for the GStreamer Go-bindings to work. 
-` ` `bash
-export CGO_ENABLED=1
-go mod tidy
-` ` `
-
----
-
-## 📄 Upgraded File Breakdown
-
-### `server.go`
-The RoQ server has been upgraded to properly emulate a live media server.
-* **Media Pacing (`sync=true`):** The GStreamer `appsink` now respects presentation timestamps, forcing the server to send data at exactly 30fps instead of dumping the file instantly and overflowing network buffers.
-* **TLS Keylogging:** Automatically exports the QUIC TLS 1.3 session keys to `secrets.txt`. This allows `tshark` to decrypt the payload and accurately track dropped packets.
-
-### `client.go`
-The RoQ client has been upgraded for headless execution and raw data capture.
-* **Tee Pipeline:** Replaced the simple screen output with a split pipeline. It now drops network bytes directly to a raw `output.ts` file for lossless metrics analysis, while optionally playing the video on screen (with a `leaky` queue so UI lag doesn't ruin the recorded file).
-* **Headless Toggle:** Contains a `headlessMode` boolean. Set to `true` to disable the video popup entirely to save VM CPU resources during heavy testing.
-* **Graceful Teardown:** Detects when the server stops sending data, waits 2 seconds, and automatically closes the application.
-
-### `run_experiment.sh`
-The automation orchestrator. This script manages the entire Mininet lifecycle.
-* Dynamically locates the Mininet `h1` and `h2` processes.
-* Launches the server and client inside the correct virtual nodes.
-* Triggers the specified network condition script (`optimal_network.sh`, `middle_network.sh`, etc.).
-* Polls the client to wait for a graceful exit.
-* **FFmpeg Post-Processing:** Automatically extracts the raw `.ts` file, pads any missing frames caused by network packet drops using the `tpad` filter, and forces exactly 1800 frames into an `.mp4` container for perfect FFMetrics synchronization.
+```text
++-------------------------------------------------------------------------------+
+|                                 SERVER SIDE                                   |
+|  [Filesrc] -> [x264enc] -> [rtph264pay] -> [AppSink]                          |
+|                                                |                              |
+|                                         (packetChan)                          |
+|                                                v                              |
+|  [SCReAM TX Rate Control] <---> [DrainQueue Pacer] -> [QUIC SendFlow]         |
++-------------------------------------------------------------------------------+
+                                                 |
+                                         QUIC Datagrams
+                                                 |
++-------------------------------------------------------------------------------+
+|                                 CLIENT SIDE                                   |
+|  [QUIC ReceiveFlow] -> [AppSrc] -> [Tee] -> [Playout Queue] -> [Fakesink]     |
+|                                      |                                        |
+|                              (SCReAM RX Telemetry)                            |
+|                                      v                                        |
+|                          [Compound RTCP Feedback]                             |
+|                    (SCReAM CC Feedback + BUFF APP Packet)                     |
++-------------------------------------------------------------------------------+
+```
 
 ---
 
-## 🚀 How to Run the Experiments
+## Key Features
 
-### Step 1: Start Mininet
-Open a terminal and start your Mininet topology. Leave this terminal running.
-` ` `bash
-sudo mn --topo=single,2 --mac --controller=none
-` ` `
+1. **RTP over QUIC (RoQ):** Low-latency media transport using QUIC Datagrams.
+2. **SCReAM Congestion Control:** Standardized congestion control designed for real-time media transport (RFC 8888 feedback).
+3. **Buffer-Aware Dynamic ABR:** Custom ABR algorithm utilizing moving average throughput smoothing ($T_{safe} = 0.8 \times T_{raw}$) and client buffer level telemetry (`"BUFF"` RTCP APP packets) to handle Fast-Start startup and steady-state switching.
+4. **Dynamic Rescaling:** Live modification of GStreamer `capsfilter` resolution constraints (**480p**, **720p**, **1080p**) without tearing down the connection.
 
-### Step 2: Build the Go Binaries
-Because this project utilizes GStreamer's C-libraries, you must explicitly enable CGO (`CGO_ENABLED=1`) during the compilation process. Do not commit these binaries to the repository; always compile fresh versions on your local machine.
+---
 
-Run the following commands in your terminal to build the application binaries:
+## Critical Bug to Fix: Server Pacing
+
+Currently, packets are being burst-transmitted without adhering to SCReAM’s pacing intervals.
+
+### Location: `server.go` -> `DrainQueue()`
+
+**Current Implementation:**
+```go
+func (server *Server) DrainQueue() {
+    for pkt := range server.packetChan {
+        // BUG: Delay calculation is ignored, no sleep is executed!
+        server.screamCC.IsOkToTransmit(time.Now(), 12345678)
+
+        err := server.sendFlow.WriteRTPBytes(pkt.payload)
+        ...
+    }
+}
+```
+
+### The Fix:
+`IsOkToTransmit()` returns a `float64` representing the required transmit delay in seconds. You need to capture this delay and force the goroutine to sleep if the delay is greater than 0:
+
+```go
+func (server *Server) DrainQueue() {
+    for pkt := range server.packetChan {
+        // 1. Get pacing delay in seconds
+        transmitDelay := server.screamCC.IsOkToTransmit(time.Now(), 12345678)
+
+        // 2. Enforce the pacing delay
+        if transmitDelay > 0 {
+            time.Sleep(time.Duration(transmitDelay * float64(time.Second)))
+        }
+
+        // 3. Transmit packet over QUIC
+        err := server.sendFlow.WriteRTPBytes(pkt.payload)
+        if err != nil {
+            logger.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
+            continue
+        }
+
+        server.screamQueue.Dequeue()
+        mark := (pkt.payload[1] & 0x80) != 0
+        server.screamCC.AddTransmitted(time.Now(), 12345678, pkt.size, pkt.sequenceNumber, mark)
+    }
+}
+```
+
+---
+
+## Prerequisites & Dependencies
+
+### 1. System Packages (Linux/Ubuntu)
+You must have Cgo and GStreamer 1.0 development packages installed:
 
 ```bash
-# Build the Server App
-CGO_ENABLED=1 go build -o server_app server.go
+sudo apt update
+sudo apt install -y \
+    golang \
+    pkg-config \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-tools
+```
 
-# Build the Client App
-CGO_ENABLED=1 go build -o client_app client.go
+### 2. TLS Certificates
+QUIC requires TLS. Generate self-signed certificates in the project root directory:
 
-### Step 3: Run the Automation Script
-Execute the script using `sudo`, passing the desired network scenario and your standardized Baseline profile reference video.
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout server.key -out server.crt -days 365 \
+    -subj "/CN=localhost"
+```
 
-**Syntax:**
-`sudo ./run_experiment.sh <scenario> <video_file>`
+---
 
-**Examples:**
-` ` `bash
-sudo ./run_experiment.sh optimal ./elephant_baseline_5mbps.mp4
-sudo ./run_experiment.sh middle ./elephant_baseline_5mbps.mp4
-sudo ./run_experiment.sh suboptimal ./elephant_baseline_5mbps.mp4
-` ` `
+## How to Run
 
-### Step 4: Check Your Output
-Once the terminal reads `EXPERIMENT COMPLETE`, navigate to your defined `SHARED_DIR`. You will find:
-1.  **`received_<scenario>.mp4`**: The padded, synchronized video ready for FFMetrics.
-2.  **`<scenario>_log.pcap`**: The full network packet capture (with `secrets.txt` available in the root folder for decryption).
+### Step 1: Launch the Server
+The server requires an IP, port, and a path to an input video file (`.mp4` or `.mkv`).
+
+```bash
+go run server.go 127.0.0.1:5000 /path/to/sample_video.mp4
+```
+
+### Step 2: Launch the Client
+In a separate terminal, launch the client. It takes the target server address and an output file path for saved stream output (`.ts`).
+
+```bash
+go run client.go 127.0.0.1:5000 output.ts
+```
+
+---
+
+## Log Analysis & Telemetry
+
+* **Server Logs (`server_abr.log`):** Logs bitrate changes, buffer feedback, active quality tiers, and encoder adjustments.
+* **QUIC TLS Secrets (`secrets.txt`):** Automatically logs TLS session keys so you can decrypt traffic in Wireshark.
+
+### ABR Resolution Tiers
+| Tier | Quality | Target Bitrate ($T_{raw}$) | Encoder Minimum | Dimensions |
+| :--- | :--- | :--- | :--- | :--- |
+| **0** | 480p | 800 kbps | 800 kbps | 854x480 |
+| **1** | 720p | 2.5 Mbps | 2500 kbps | 1280x720 |
+| **2** | 1080p | 5.0 Mbps | 5000 kbps | 1920x1080 |
