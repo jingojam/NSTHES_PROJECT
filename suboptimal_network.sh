@@ -20,5 +20,5 @@ echo "Network profile timeline complete. Extending observation window..."
 sleep 110
 
 # 2. Copy the complete log file
-cp /tmp/suboptimal_log.pcap "/mnt/hgfs/THESIS SHARED FOLDER/"
+cp /tmp/suboptimal_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
 echo "Log saved to Shared Folder!"

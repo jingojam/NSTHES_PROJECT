@@ -65,6 +65,8 @@ type Packet struct{
 	size int
 	sequenceNumber uint16
 	timestamp time.Time
+	mark bool
+	payload []byte
 }
 
 /*
@@ -97,6 +99,7 @@ func (packet* Packet) Timestamp() time.Time{
 type Server struct {
 	/*thread safety*/
 	qPipeLock sync.RWMutex // read/write lock for modifying a pipeline element
+	paceSenderSignal chan struct{} // go channel for signalling
 	
 	/*Network attributes*/
 	ip   string
@@ -137,6 +140,7 @@ type Server struct {
  */
 func CreateServer(ip string, port uint64) *Server {
 	return &Server {
+		paceSenderSignal:	make(chan struct{}, 1),
 		ip:             ip,
 		port:           port,
 		screamCC:       scream.NewTx(),
@@ -166,14 +170,14 @@ func (server *Server) InitializePipeline(videoFile string) {
 	pipeline := fmt.Sprintf(
 		`filesrc location=%s name=source ! `+
 		`qtdemux name=demux demux.video_0 ! `+
-		`queue ! `+
+		`queue max-size-buffers=1000 max-size-bytes=0 max-size-time=0 ! `+
 		`h264parse name=parser ! `+
 		`avdec_h264 ! `+
 		`videoscale ! `+
 		`capsfilter name=filter caps=video/x-raw,width=%d,height=%d ! `+
 		`x264enc name=encoder bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
 		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 ! `+
-		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, uint(quality[low].targetbitrate/1000),
+		`appsink name=sink sync=true max-buffers=100 `, videoFile, quality[low].width, quality[low].height, uint(quality[low].targetbitrate/1000),
 	)
 	
 	var err error
@@ -240,7 +244,7 @@ func (server *Server) AdjustVideoQuality(tier int){
 		return
 	}
 	
-	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n", time.Now(), quality[tier].quality)
+	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n\n", time.Now().Format("15:04:05.000"), quality[tier].quality)
 }
 
 /*
@@ -270,7 +274,7 @@ func (server *Server) CreateQUICConnection() error {
 		return fmt.Errorf("[Error] Error listening on UDP socket: %v", err)
 	}
 	
-	keylogWriter, err := os.OpenFile("secrets.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	keylogWriter, err := os.OpenFile("secrets.txt", os.O_CREATE|os.O_WRONLY, 0600)
 	quicTransport := &quic.Transport{Conn: udpConnection}
 	
 	tlsConfig := &tls.Config {
@@ -324,7 +328,7 @@ func (server *Server) InitializeServer() error {
 		return fmt.Errorf("[Error] Error establishing send flow: %w", err)
 	}
 	
-	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, 100000, 50000000, 50000000)
+	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, quality[low].targetbitrate, quality[low].targetbitrate, quality[high].maxbitrate)
 	fmt.Println("[Status] Server initialized")
 	return nil
 }
@@ -337,8 +341,9 @@ func (server *Server) StartStream() error {
 	if err != nil {
 		return fmt.Errorf("[Error] Failed to initialize server: %v", err)
 	}
-	
+
 	go server.ReceiveFeedback()
+	go server.SendPace()
 	
 	mainLoop := glib.NewMainLoop(nil, true)
 	appSink := app.SinkFromElement(server.sink)
@@ -364,24 +369,23 @@ func (server *Server) StartStream() error {
 			size := len(data)
 			mark := (data[1] & 0x80) != 0
 
+			payload := make([]byte, size)
+			copy(payload, data)
+			
+			now := time.Now()
+
 			pkt := &Packet{
 				size:           size,
 				sequenceNumber: sequenceNumber,
-				timestamp:      time.Now(),
+				timestamp:      now,
+				mark:			mark,
+				payload:		payload,
 			}
 			
-			server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
-			server.screamCC.IsOkToTransmit(time.Now(), 12345678)
 			server.screamQueue.Enqueue(pkt)
-			
-			err := server.sendFlow.WriteRTPBytes(data)
-			if err != nil {
-				fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
-				return gst.FlowError
-			}
-		
-			server.screamQueue.Dequeue()
-			server.screamCC.AddTransmitted(time.Now(), 12345678, size, sequenceNumber, mark)
+			server.screamCC.NewMediaFrame(now, 12345678, pkt.size, pkt.mark)
+			fmt.Printf("<%s> [SCReAM Log] %s, queue length = %d, bytes in queue = %d b\n\n", now.Format("15:04:05.000"), server.screamCC.GetStatistics(time.Now()), server.screamQueue.SizeOfQueue(), server.screamQueue.BytesInQueue())
+			server.SignalPaceSender() // signal pacing sender, since NewMediaFrame requires IsOkToTransmit to be executed after
 			
 			return gst.FlowOK
 		},
@@ -391,6 +395,67 @@ func (server *Server) StartStream() error {
 	mainLoop.Run()
 	return nil
 }
+
+func(server *Server) SignalPaceSender(){
+	select{
+		case server.paceSenderSignal <- struct{}{}: // send an empty struct to the signalling channel to trigger a signal
+		default:
+		// signal is discarded
+	}
+}
+
+func(server *Server) SendPace(){
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
+	
+	for{
+		// SCReAM check to validate if it's ok to send packets to client
+		now := time.Now()
+		okToSend := server.screamCC.IsOkToTransmit(now, 12345678)
+		
+		if okToSend == 0.0{ 		// 0 = ok to transmit
+			// dequeue packet from SCReAM queue and then send the rtp packet
+			pkt, ok := server.screamQueue.Dequeue()
+			
+			if ok{
+				err := server.sendFlow.WriteRTPBytes(pkt.payload)
+				
+				if err != nil {
+					fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
+					return
+				}
+				
+				// check when is the next time to call IsOkToTransmit again
+				nextCall := server.screamCC.AddTransmitted(now, 12345678, pkt.size, pkt.sequenceNumber, pkt.mark)
+				
+				if nextCall > 0{
+					// set a timer of the specified amount if tehre is
+					timer.Reset(time.Duration(nextCall * float64(time.Second)))
+					
+				} else{
+					// otherwise if the timer is 0 (now), go back to the start again to call IsOkToTransmit
+					continue
+				}
+			} else{
+				timer.Stop()
+			}
+		} else if okToSend > 0.0{ // >0 = time until IsOkToTransmit() should be called again
+			// sleep for okToSend amount of time
+			timer.Reset(time.Duration(okToSend * float64(time.Second)))
+		} else{ // <0 = queue empty, or the scream congestion window is full
+			// wait 
+			timer.Stop()
+		}
+		
+		// block the goroutine and wait for timer to end, or signal from other functions
+		select{
+			case <-timer.C: // if timer ends, jump back to the start of the for-loop
+			case <-server.paceSenderSignal: // if signalled by another function, jump back to the start of the for-loop
+				timer.Stop()
+		}
+	}
+}	
 
 /*
  * Function for receiving RTCP feedback from the Client
@@ -412,7 +477,9 @@ func (server *Server) ReceiveFeedback(){
 		feedbackPacket := compoundPacket[:feedbackSize]
 		appPacket := compoundPacket[feedbackSize:]
 		
+		//fmt.Printf("[ABR] RTCP Feedback=%d bytes, RTCP app=%d bytes\n", len(feedbackPacket), len(appPacket))
 		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedbackPacket)
+		server.SignalPaceSender()
 		
 		rawData := appPacket[12:]
 		clientBuffer := make([]uint32, (len(rawData))/4)
@@ -459,20 +526,20 @@ func (server *Server) ABR(clientBuffer uint32){
 	Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
 	
 	if Traw != -1.0{ 
-		fmt.Printf("[%s] [ABR] Bcurrent = %d ms, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n", time.Now(), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
+		fmt.Printf("<%s> [ABR] Bcurrent = %d ms, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
 		Tsafe := ComputeSafeThroughput(Traw)
 		Rtarget := ComputeTier(Tsafe)
 
 		// --------- SCENARIO A ---------
 		if Rtarget > server.Rcurrent{
 			if server.isStartup{
-				fmt.Printf("[%s] [ABR] Fast-start phase: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+				fmt.Printf("<%s> [ABR] Fast-start phase: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
 				server.Rcurrent = Rtarget
 				server.AdjustVideoQuality(Rtarget)
 			} else{
 				if server.upgradeTimer == nil{
 					upgrade := func(){
-						fmt.Printf("[%s] [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+						fmt.Printf("<%s> [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
 						server.Rcurrent = Rtarget
 						server.AdjustVideoQuality(Rtarget)
 						server.upgradeTimer = nil
@@ -483,16 +550,17 @@ func (server *Server) ABR(clientBuffer uint32){
 		} else if Rtarget < server.Rcurrent{ // --------- SCENARIO B ---------
 			// FIXED: Now safely restored to your 1-second (1000ms) panic threshold
 			if clientBuffer > 1000{
-				fmt.Printf("[%s] [ABR] Maintaining %s bitrate tier\n", time.Now(), quality[server.Rcurrent].quality)
+				fmt.Printf("<%s> [ABR] Maintaining %s bitrate tier\n\n", time.Now().Format("15:04:05.000"), quality[server.Rcurrent].quality)
 			} else{		
-				fmt.Printf("[%s] [ABR] Buffer depleted (%d ms). Downgrading bitrate tier to %s\n", time.Now(), clientBuffer, quality[Rtarget].quality)
+				fmt.Printf("<%s> [ABR] Buffer depleted (%d ms). Downgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[Rtarget].quality)
 				server.Rcurrent = Rtarget
 				server.AdjustVideoQuality(Rtarget)
 				server.isStartup = false
 			}
 		} else{ // --------- SCENARIO C ---------
 			if server.upgradeTimer != nil{
-				fmt.Printf("[%s] [ABR] Upgrade timer reset \n", time.Now())
+				fmt.Printf("<%s> [ABR] Upgrade timer reset\n\n", time.Now().Format("15:04:05.000"))
+				server.upgradeTimer.Stop()
 				server.upgradeTimer = nil
 			}
 			if server.Rcurrent == high{

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+WD=$(pwd)
+
+echo "$WD"
+
 # Ensure script is run with sudo
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (sudo ./run_experiment.sh <scenario> <video_file>)"
@@ -30,19 +34,19 @@ fi
 echo "[Status] Found h1 (PID: $H1_PID) and h2 (PID: $H2_PID)"
 
 # 2. Define staging TS file and final MP4 destination
-SHARED_DIR="/mnt/hgfs/THESIS SHARED FOLDER"
-RAW_TS="$SHARED_DIR/received_${SCENARIO}.ts"
-FINAL_MP4="$SHARED_DIR/received_${SCENARIO}.mp4"
+SHARED_DIR="${WD}/"
+RAW_TS="${WD}/received_output.ts"
+FINAL_MP4="${WD}/received_${SCENARIO}.mp4"
 
 # Clean up any leftover staging file from previous attempts
 rm -f "$RAW_TS"
 
-# 3. Launch the Server on h1 (Background) with GStreamer Debugging Enabled
+# 3. Launch the Server on h1 (Background)
 echo "[Executing] Launching Server on h1..."
-sudo mnexec -a $H1_PID env GST_DEBUG=3 ./server_app 10.0.0.1:5000 "$VIDEO_FILE" > /tmp/server_execution.log 2>&1 &
+sudo mnexec -a $H1_PID ./server_app 10.0.0.1:5000 "$VIDEO_FILE" > /tmp/server_execution.log 2>&1 &
 SERVER_PROC_PID=$!
 
-sleep 2
+sleep 5
 
 # 4. Launch the Client on h2 (Background) -> Saving TS stream
 echo "[Executing] Launching Client on h2 (Capturing TS stream)..."

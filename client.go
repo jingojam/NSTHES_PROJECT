@@ -172,7 +172,7 @@ func (client *Client) InitializePipeline(outputFile string) {
 			"rtph264depay ! h264parse ! mpegtsmux ! "+
 			"tee name=t "+
 			"t. ! queue ! filesink location=\"%s\" "+
-			"t. ! queue name=buffer max-size-time=10000000000 max-size-buffers=0 max-size-bytes=0 ! fakesink sync=true ts-offset=3000000000", outputFile,
+			"t. ! queue name=buffer max-size-time=10000000000 max-size-buffers=1000 max-size-bytes=0 ! fakesink sync=true ts-offset=3000000000", outputFile,
 	)
 
 	pipeline, err := gst.NewPipelineFromString(pipelineStr)
@@ -326,16 +326,18 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 		ceBits := uint8(0)
 		mark := (buffer[1] & 0x80) != 0
 
+		now := toNTP(time.Now())
+
 		// this Receive method needs to be called every time an rtp packet arrives
-		client.screamRx.Receive(toNTP(time.Now()), ssrc, size, sequenceNumber, ceBits, mark)
+		client.screamRx.Receive(now, ssrc, size, sequenceNumber, ceBits, mark)
 		
 		// if its a feedback, send feedback to the server on rtp over the media quic Connection
-		if client.screamRx.IsFeedback(toNTP(time.Now())){
-				feedback, flag := client.screamRx.CreateStandardizedFeedback(toNTP(time.Now()), mark) // feedback is an RTCP CC feedback packet with SCReAM metrics
+		if client.screamRx.IsFeedback(now){
+				feedback, flag := client.screamRx.CreateStandardizedFeedback(now, mark) // feedback is an RTCP CC feedback packet with SCReAM metrics
 
 				if flag{
 					clientBuffer := []uint32{uint32(client.GetClientBuffer())} // get the client buffer time in milliseconds
-					appPacket := CreateRTCP_APP_Packet(uint16(3 + len(clientBuffer)) - 1, 12354678, appPacketName, clientBuffer)// create an APP packet with the client buffer time as data
+					appPacket := CreateRTCP_APP_Packet(uint16(3 + len(clientBuffer)) - 1, 12345678, appPacketName, clientBuffer)// create an APP packet with the client buffer time as data
 					compoundPacket := append(feedback, appPacket.Marshal()...) // create an RTCP Compound packet (2+ RTCP packets concatenated)
 
 					err := client.quicConnection.SendDatagram(compoundPacket) //send the compound packet back to the server

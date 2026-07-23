@@ -26,5 +26,5 @@ tc qdisc change dev h1-eth0 root netem delay 20ms rate 12mbit
 sleep 60
 
 # 2. Copy the complete log file
-cp /tmp/middle_log.pcap "/mnt/hgfs/THESIS SHARED FOLDER/"
+cp /tmp/middle_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
 echo "Log saved to Shared Folder!"
