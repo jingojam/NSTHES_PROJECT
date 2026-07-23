@@ -6,22 +6,22 @@ tshark -i h1-eth0 -a duration:120 -w /tmp/middle_log.pcap &
 # 1. Clear any old rules
 tc qdisc del dev h1-eth0 root 2>/dev/null
 
-echo "[Status] Starting Middle Scenario (3-second Oscillation Loop)"
+echo "[Status] Starting Middle Scenario (6-second Oscillation Loop)"
 tc qdisc add dev h1-eth0 root netem delay 20ms rate 12mbit
 
-# Loop for ~60 seconds of active video streaming (10 iterations of 6 seconds)
-for i in {1..10}
+# Loop for 60 seconds (5 iterations of 12 seconds total per cycle)
+for i in {1..5}
 do
-    echo "[$((i*6-6))s] Oscillation: 12 Mbps"
+    echo "[$(( (i-1)*12 ))s] High Bandwidth (12 Mbps) -> Prompts 1080p Upgrade"
     tc qdisc change dev h1-eth0 root netem delay 20ms rate 12mbit
-    sleep 3
-    
-    echo "[$((i*6-3))s] Oscillation: 6 Mbps"
-    tc qdisc change dev h1-eth0 root netem delay 20ms rate 6mbit
-    sleep 3
+    sleep 6
+
+    echo "[$(( (i-1)*12 + 6 ))s] Low Bandwidth (3.5 Mbps) -> Drains Buffer & Forces 720p Downgrade"
+    tc qdisc change dev h1-eth0 root netem delay 20ms rate 3.5mbit
+    sleep 6
 done
 
-echo "[60s] Network profile timeline complete. Extending observation window..."
+echo "[60s] Oscillation loop complete. Restoring full bandwidth..."
 tc qdisc change dev h1-eth0 root netem delay 20ms rate 12mbit
 sleep 60
 

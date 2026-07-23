@@ -13,166 +13,116 @@ import (
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/mengelbart/roq"
-	"github.com/quic-go/quic-go"
 	scream "github.com/mengelbart/scream-go"
+	"github.com/quic-go/quic-go"
 )
 
-/*
- * RTCP Packet RFCs:
- * - RTCP APP packet: https://datatracker.ietf.org/doc/html/rfc3550#section-6.7
- * - RTCP Compound packet: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rtpme/e2e2deb3-2f87-4932-a9c5-1dbde47fb12d
- * - RTCP CC Feedback packet: https://datatracker.ietf.org/doc/html/rfc8888#section-3.1
- */
- 
-// Flow ID constant = 1
-var flowID uint64 = 1
+const (
+	mediaFlowID      uint64        = 1
+	streamSSRC       uint32        = 12345678
+	feedbackInterval time.Duration = 50 * time.Millisecond
+)
 
 // 32-bit RTCP APP Packet `name` field = "BUFF" (big-endian)
-var appPacketName uint32 = (uint32('B') << 24) | 
-						   (uint32('U') << 16) | 
-						   (uint32('F') << 8)  | 
-							uint32('F')
+var appPacketName uint32 = (uint32('B') << 24) |
+	(uint32('U') << 16) |
+	(uint32('F') << 8) |
+	uint32('F')
 
 /*
- * RTCP APP Packet struct fields
- * as per https://datatracker.ietf.org/doc/html/rfc3550#section-6.7
+ * RTCP APP Packet struct (RFC 3550 Section 6.7)
  */
-type RTCP_APP_Packet struct{
-	version uint8   // 2 bits
-	padding uint8   // 1 bit
-	subtype uint8   // 5 bits
-	pt uint8  		// 8 bits   (1 byte)
-	length uint16   // 16 bits  (2 bytes)
-	ssrc uint32     // 32 bits  (4 bytes)
-	name uint32     // 32 bits  (4 bytes)
-	data []uint32   // variable (n bytes)
+type RTCP_APP_Packet struct {
+	version uint8    // 2 bits
+	padding uint8    // 1 bit
+	subtype uint8    // 5 bits
+	pt      uint8    // 8 bits   (1 byte: 204 for APP)
+	length  uint16   // 16 bits  (2 bytes)
+	ssrc    uint32   // 32 bits  (4 bytes)
+	name    uint32   // 32 bits  (4 bytes)
+	data    []uint32 // variable (n bytes)
 }
 
-/*
- * Function to initialize an RTCP APP Packet struct,
- * Returns an RTCP APP packet
- */
-func CreateRTCP_APP_Packet(length uint16, ssrc uint32, name uint32, data []uint32) *RTCP_APP_Packet{
+func CreateRTCP_APP_Packet(length uint16, ssrc uint32, name uint32, data []uint32) *RTCP_APP_Packet {
 	return &RTCP_APP_Packet{
-		version:	2,
-		padding:	0,
-		subtype:	0,
-		pt:			204,
-		length:		length,
-		ssrc:		ssrc,
-		name:		name,
-		data:		data,
+		version: 2,
+		padding: 0,
+		subtype: 0,
+		pt:      204,
+		length:  length,
+		ssrc:    ssrc,
+		name:    name,
+		data:    data,
 	}
 }
 
-/*
- * Function for marshalling (converting structure into network-transmittable format)
- * an RTCP APP Packet in big-endian order
- * Returns RTCP APP packet in []byte array
- */
-func (appPacket *RTCP_APP_Packet) Marshal() []byte{
+func (appPacket *RTCP_APP_Packet) Marshal() []byte {
 	totalBytes := 12 + (len(appPacket.data) * 4)
 	packet := make([]byte, totalBytes)
-	
-	// each `packet` index is 1 byte (8 bits) wide
-	packet[0] = ((appPacket.version & 0x03) << 6) | ((appPacket.padding & 0x01) << 5) | (appPacket.subtype & 0x1f) // couple all 3 fields into one byte
-	
+
+	packet[0] = ((appPacket.version & 0x03) << 6) | ((appPacket.padding & 0x01) << 5) | (appPacket.subtype & 0x1f)
 	packet[1] = appPacket.pt & 0xff
-	
-	// length field is 16-bits (2 bytes) in size
+
 	packet[2] = byte((appPacket.length >> 8) & 0xff)
 	packet[3] = byte((appPacket.length) & 0xff)
-	
-	// ssrc field is 32-bits (4 bytes) in size
+
 	packet[4] = byte((appPacket.ssrc >> 24) & 0xff)
 	packet[5] = byte((appPacket.ssrc >> 16) & 0xff)
 	packet[6] = byte((appPacket.ssrc >> 8) & 0xff)
 	packet[7] = byte((appPacket.ssrc) & 0xff)
-	
-	// name field is 32-bits (4 bytes) in size
-	packet[8]  = byte((appPacket.name >> 24) & 0xff)
-	packet[9]  = byte((appPacket.name >> 16) & 0xff)
+
+	packet[8] = byte((appPacket.name >> 24) & 0xff)
+	packet[9] = byte((appPacket.name >> 16) & 0xff)
 	packet[10] = byte((appPacket.name >> 8) & 0xff)
-	packet[11] = byte((appPacket.name) & 0x0ff)
-	
-	// data field is variable-length
-	for i, value := range appPacket.data{
-		index := 12 + (i * 4) // index per block of 4 bytes starting from index 12...onwards
-		packet[index + 0]  = byte((value >> 24) & 0xff)
-		packet[index + 1]  = byte((value >> 16) & 0xff)
-		packet[index + 2] = byte((value >> 8) & 0xff)
-		packet[index + 3] = byte(value & 0x0ff)
+	packet[11] = byte((appPacket.name) & 0xff)
+
+	for i, value := range appPacket.data {
+		index := 12 + (i * 4)
+		packet[index+0] = byte((value >> 24) & 0xff)
+		packet[index+1] = byte((value >> 16) & 0xff)
+		packet[index+2] = byte((value >> 8) & 0xff)
+		packet[index+3] = byte(value & 0xff)
 	}
-	
+
 	return packet
 }
 
-/*
- * RoQ Client struct
- */
 type Client struct {
-	/*Network attributes*/
 	ip             string
 	port           uint64
 	quicConnection quic.Connection
 	receiveFlow    *roq.ReceiveFlow
-	
-	/*SCReAM congestion controller (feedback)*/
+
 	screamRx *scream.Rx
 
-	/*Gstreamer elements*/
 	pipeline     *gst.Pipeline
 	source       *gst.Element
-	buffer 		 *gst.Element
-	depayloader  *gst.Element
-	parser       *gst.Element
-	decoder      *gst.Element
-	videoconvert *gst.Element
-	sink         *gst.Element
+	playoutQueue *gst.Element
 }
 
-/*
- * Function for initializing an RoQ client/receiver
- *
- * Parameters:
- * 	- ip address string
- *  - port number
- *
- * Returns a `Client` struct
- */
 func CreateClient(ip string, port uint64) *Client {
 	return &Client{
-		ip:             ip,
-		port:           port,
-		quicConnection: nil,
-		receiveFlow:    nil,
-		screamRx:		scream.NewRx(12345678), // ssrc is 12345678 by default to match server-peer ssrc
-		pipeline:       nil,
-		source:         nil,
-		buffer:			nil,
-		depayloader:    nil,
-		parser:         nil,
-		decoder:        nil,
-		videoconvert:   nil,
-		sink:           nil,
+		ip:       ip,
+		port:     port,
+		screamRx: scream.NewRx(streamSSRC),
 	}
 }
 
-/*
- * Function for initializing the Gstreamer pipeline
- *
- * Parameters:
- *  - outputFile string for filesink
- */
 func (client *Client) InitializePipeline(outputFile string) {
-	// FIX: Aligned with thesis document to support a 3-second (3000ms) maximum buffer cushion.
-	// ts-offset=3000000000 delays rendering by exactly 3 seconds, storing all frames in our tracker queue.
+	// Replaced jitterbuffer with a clean tee architecture:
+	// - appsrc assigns live timestamps (is-live=true do-timestamp=true).
+	// - tee splits the stream BEFORE mpegtsmux.
+	// - Branch 1 (filesink): multiplexes to MPEG-TS and saves to disk.
+	// - Branch 2 (playout_queue): acts as the dynamic buffer we measure, held back 
+	//   by a fakesink with a 3-second offset.
 	pipelineStr := fmt.Sprintf(
-		"appsrc name=src is-live=true do-timestamp=false format=time caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264\" ! "+
-			"rtph264depay ! h264parse ! mpegtsmux ! "+
-			"tee name=t "+
-			"t. ! queue ! filesink location=\"%s\" "+
-			"t. ! queue name=buffer max-size-time=10000000000 max-size-buffers=0 max-size-bytes=0 ! fakesink sync=true ts-offset=3000000000", outputFile,
+		`appsrc name=src is-live=true do-timestamp=true format=time caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=H264" ! `+
+			`rtph264depay ! h264parse ! `+
+			`tee name=t `+
+			`t. ! queue ! mpegtsmux ! filesink location="%s" `+
+			`t. ! queue name=playout_queue max-size-time=10000000000 max-size-bytes=0 max-size-buffers=0 ! `+
+			`fakesink sync=true ts-offset=3000000000`,
+		outputFile,
 	)
 
 	pipeline, err := gst.NewPipelineFromString(pipelineStr)
@@ -182,32 +132,10 @@ func (client *Client) InitializePipeline(outputFile string) {
 	}
 
 	client.pipeline = pipeline
-
-	srcElement, err := client.pipeline.GetElementByName("src")
-	if err != nil {
-		fmt.Printf("[Error] Failed to find src element: %v\n", err)
-		return
-	}
-	client.source = srcElement
-	
-	// Targets the branch buffer right before the fakesink layout
-	bufferElement, err := client.pipeline.GetElementByName("buffer")
-	if err != nil {
-		fmt.Printf("[Error] Failed to find queue element: %v\n", err)
-		return
-	}
-	
-	client.buffer = bufferElement
+	client.source, _ = client.pipeline.GetElementByName("src")
+	client.playoutQueue, _ = client.pipeline.GetElementByName("playout_queue")
 }
 
-/*
- * Function to start the client QUIC connection
- *
- * Parameters:
- *	- outputFile string for filesink
- *
- * Returns an error if any, otherwise NULL
- */
 func (client *Client) RunClient(outputFile string) error {
 	client.InitializePipeline(outputFile)
 
@@ -216,7 +144,6 @@ func (client *Client) RunClient(outputFile string) error {
 		NextProtos:         []string{"roq-10"},
 	}
 
-	// We must explicitly enable datagrams at the underlying QUIC transport layer!
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 	}
@@ -228,13 +155,12 @@ func (client *Client) RunClient(outputFile string) error {
 	client.quicConnection = conn
 
 	roqConn := roq.NewQUICGoConnection(conn)
-	
 	session, err := roq.NewSession(roqConn, true, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create RoQ client session: %w", err)
 	}
 
-	flow, err := session.NewReceiveFlow(flowID)
+	flow, err := session.NewReceiveFlow(mediaFlowID)
 	if err != nil {
 		return fmt.Errorf("failed to create receive flow: %w", err)
 	}
@@ -242,8 +168,8 @@ func (client *Client) RunClient(outputFile string) error {
 
 	mainLoop := glib.NewMainLoop(nil, false)
 
-	// Spin up goroutine to feed incoming QUIC packets to GStreamer appsrc
 	go client.ReceivePackets(mainLoop)
+	go client.feedbackLoop()
 
 	client.pipeline.SetState(gst.StatePlaying)
 
@@ -254,61 +180,40 @@ func (client *Client) RunClient(outputFile string) error {
 	return nil
 }
 
-/*
- * Helper function implementation from the SCReAM Go wrapper
- * Converts time to NTP
- *
- * Parameters:
- *	- t, which is a Time struct
- *
- * Returns time in uint32
- */
-func toNTP(t time.Time) uint32{
-    s := (float64(t.UnixNano()) / 1000000000) + 2208988800
-    return uint32(s * 65536)
+// Replaced toCompactNTP with toNTP to fix the RTT calculation mismatch
+func toNTP(t time.Time) uint32 {
+	s := (float64(t.UnixNano()) / 1000000000) + 2208988800
+	return uint32(s * 65536)
 }
 
-/*
- * Function to get client buffer time in nanoseconds
- * Returns client buffer time in uint64 (converted to Milliseconds)
- */
-func (client *Client) GetClientBuffer() uint64{
-	// current-level-time property of the queue element returns the buffer time in nanoseconds
-	duration, err := client.buffer.GetProperty("current-level-time")
-	
-	if err != nil{
-		fmt.Printf("[Error] Error fetching client buffer: %s\n", err)
+// Retrieves the current depth of the playout queue in milliseconds
+func (client *Client) getBufferLevelMs() uint32 {
+	if client.playoutQueue == nil {
 		return 0
 	}
-	
-	nanoseconds, ok := duration.(uint64)
-	
-	if !ok{
-		fmt.Printf("[Error] Buffer property type mismatch\n")
-		return 0	
+
+	val, err := client.playoutQueue.GetProperty("current-level-time")
+	if err != nil {
+		return 0
 	}
-	
-	// Real-time jitter metrics scale accurately inside millisecond boundaries.
-	bufferMS := nanoseconds / 1000000
-	fmt.Printf("Client BUFFER: %d ms\n", bufferMS)
-	
-	return bufferMS
+
+	var levelNs uint64
+	switch v := val.(type) {
+	case uint64:
+		levelNs = v
+	default:
+		return 0
+	}
+
+	return uint32(levelNs / 1_000_000)
 }
 
-/*
- * Function for receiving QUIC packets from the server peer 
- *  and sending RTCP feedback to the Server
- *
- * Parameters:
- *	- mainLoop glib event loop manager 
- */
-func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
+func (client *Client) ReceivePackets(mainLoop *glib.MainLoop) {
 	buffer := make([]byte, 65536)
 	appsource := app.SrcFromElement(client.source)
 
 	for {
 		size, err := client.receiveFlow.Read(buffer)
-		
 		if err != nil {
 			fmt.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
 			break
@@ -320,30 +225,14 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 
 		bytes := make([]byte, size)
 		copy(bytes, buffer[:size])
-		
-		ssrc := uint32(buffer[8])<<24 | uint32(buffer[9])<<16 | uint32(buffer[10])<<8 | uint32(buffer[11])
-		sequenceNumber := uint16(buffer[2])<<8 | uint16(buffer[3])
-		ceBits := uint8(0)
-		mark := (buffer[1] & 0x80) != 0
 
-		// this Receive method needs to be called every time an rtp packet arrives
-		client.screamRx.Receive(toNTP(time.Now()), ssrc, size, sequenceNumber, ceBits, mark)
-		
-		// if its a feedback, send feedback to the server on rtp over the media quic Connection
-		if client.screamRx.IsFeedback(toNTP(time.Now())){
-				feedback, flag := client.screamRx.CreateStandardizedFeedback(toNTP(time.Now()), mark) // feedback is an RTCP CC feedback packet with SCReAM metrics
+		// Ensure we extract the SSRC properly from a standard 12-byte RTP header
+		if len(bytes) >= 12 {
+			ssrc := uint32(bytes[8])<<24 | uint32(bytes[9])<<16 | uint32(bytes[10])<<8 | uint32(bytes[11])
+			sequenceNumber := uint16(bytes[2])<<8 | uint16(bytes[3])
+			mark := (bytes[1] & 0x80) != 0
 
-				if flag{
-					clientBuffer := []uint32{uint32(client.GetClientBuffer())} // get the client buffer time in milliseconds
-					appPacket := CreateRTCP_APP_Packet(uint16(3 + len(clientBuffer)) - 1, 12354678, appPacketName, clientBuffer)// create an APP packet with the client buffer time as data
-					compoundPacket := append(feedback, appPacket.Marshal()...) // create an RTCP Compound packet (2+ RTCP packets concatenated)
-
-					err := client.quicConnection.SendDatagram(compoundPacket) //send the compound packet back to the server
-					
-					if err != nil{
-						fmt.Printf("\n[SCReAM Log] Error sending RTCP feedback: %v\n", err)
-					}
-				}
+			client.screamRx.Receive(toNTP(time.Now()), ssrc, size, sequenceNumber, 0, mark)
 		}
 
 		gstbuf := gst.NewBufferFromBytes(bytes)
@@ -355,13 +244,44 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	}
 
 	appsource.EndStream()
-	time.Sleep(2 * time.Second) // Let the pipeline drain cleanly
+	time.Sleep(2 * time.Second)
 	mainLoop.Quit()
 }
 
-/*
- * Function for cleaning resources of the client
- */
+func (client *Client) feedbackLoop() {
+	ticker := time.NewTicker(feedbackInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		nowNTP := toNTP(time.Now())
+		if !client.screamRx.IsFeedback(nowNTP) {
+			continue
+		}
+
+		feedbackBuf, ok := client.screamRx.CreateStandardizedFeedback(nowNTP, false)
+		if !ok || len(feedbackBuf) == 0 {
+			continue
+		}
+
+		// Dynamically read buffer occupancy from playoutQueue
+		bufferMs := client.getBufferLevelMs()
+
+		// Construct the correctly formatted RTCP APP packet
+		appPacket := CreateRTCP_APP_Packet(
+			uint16(3+1)-1,
+			streamSSRC,
+			appPacketName,
+			[]uint32{bufferMs},
+		)
+
+		compoundPacket := append(feedbackBuf, appPacket.Marshal()...)
+
+		if err := client.quicConnection.SendDatagram(compoundPacket); err != nil {
+			fmt.Printf("[Client Log] failed to send SCReAM feedback: %v\n", err)
+		}
+	}
+}
+
 func (client *Client) CloseClient() {
 	if client.pipeline != nil {
 		client.pipeline.SetState(gst.StateNull)
