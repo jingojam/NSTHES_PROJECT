@@ -85,7 +85,7 @@ func (server *Server) DrainQueue() {
         server.screamCC.AddTransmitted(time.Now(), 12345678, pkt.size, pkt.sequenceNumber, mark)
     }
 }
-
+```
 ## ABR Heuristics & Key Updates
 
 ### 1. Updated Resolution Tiers & Bitrate Mapping
@@ -123,7 +123,6 @@ Bitrate targets and encoder minimum floors were updated to match standard encodi
 * **Improved Fast-Start Startup & Cooldown Logic:**
   * **Fast-Start Exit Conditions:** Fast-start phase now terminates either when reaching **1080p** or if client playout buffer drops below **300 ms**.
   * **Switch Cooldown:** Added a **3-second cooldown lock** after any resolution change to allow GStreamer caps pipeline adjustments to stabilize.
-```
 
 ---
 
