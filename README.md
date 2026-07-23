@@ -85,67 +85,45 @@ func (server *Server) DrainQueue() {
         server.screamCC.AddTransmitted(time.Now(), 12345678, pkt.size, pkt.sequenceNumber, mark)
     }
 }
-```
 
----
+## ABR Heuristics & Key Updates
 
-## Prerequisites & Dependencies
+### 1. Updated Resolution Tiers & Bitrate Mapping
+Bitrate targets and encoder minimum floors were updated to match standard encoding tiers:
 
-### 1. System Packages (Linux/Ubuntu)
-You must have Cgo and GStreamer 1.0 development packages installed:
-
-```bash
-sudo apt update
-sudo apt install -y \
-    golang \
-    pkg-config \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
-    gstreamer1.0-tools
-```
-
-### 2. TLS Certificates
-QUIC requires TLS. Generate self-signed certificates in the project root directory:
-
-```bash
-openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout server.key -out server.crt -days 365 \
-    -subj "/CN=localhost"
-```
-
----
-
-## How to Run
-
-### Step 1: Launch the Server
-The server requires an IP, port, and a path to an input video file (`.mp4` or `.mkv`).
-
-```bash
-go run server.go 127.0.0.1:5000 /path/to/sample_video.mp4
-```
-
-### Step 2: Launch the Client
-In a separate terminal, launch the client. It takes the target server address and an output file path for saved stream output (`.ts`).
-
-```bash
-go run client.go 127.0.0.1:5000 output.ts
-```
-
----
-
-## Log Analysis & Telemetry
-
-* **Server Logs (`server_abr.log`):** Logs bitrate changes, buffer feedback, active quality tiers, and encoder adjustments.
-* **QUIC TLS Secrets (`secrets.txt`):** Automatically logs TLS session keys so you can decrypt traffic in Wireshark.
-
-### ABR Resolution Tiers
-| Tier | Quality | Target Bitrate ($T_{raw}$) | Encoder Minimum | Dimensions |
+| Tier | Quality | Target Bitrate ($T_{raw}$) | Minimum Encoder Bitrate | Resolution |
 | :--- | :--- | :--- | :--- | :--- |
-| **0** | 480p | 800 kbps | 800 kbps | 854x480 |
-| **1** | 720p | 2.5 Mbps | 2500 kbps | 1280x720 |
-| **2** | 1080p | 5.0 Mbps | 5000 kbps | 1920x1080 |
+| **0 (Low)** | 480p | 800 kbps (0.8 Mbps) | 800 kbps | 854x480 |
+| **1 (Mid)** | 720p | 2.5 Mbps | 2500 kbps | 1280x720 |
+| **2 (High)** | 1080p | 5.0 Mbps | 5000 kbps | 1920x1080 |
+
+---
+
+### 2. Key Heuristic Differences & Changes
+
+* **Stability Timer Reduced (5.0s → 2.5s):** 
+  * **Old:** Required holding higher throughput target for **5.0 seconds** before triggering a resolution upgrade.
+  * **New:** Reduced the upgrade stability timer to **2.5 seconds** (`2500ms`) to enable faster adaptation to available bandwidth.
+
+* **Throughput Smoothing via Moving Average:**
+  * **Old:** Used instantaneous $T_{safe}$ values, which caused rapid bitrate oscillation on short throughput spikes.
+  * **New:** Implemented a **10-sample moving average** (`getSmoothedTsafe()`) over $T_{safe}$ telemetry (~1 second window) to smooth out decisions.
+
+* **Realistic Tier Selection Thresholds (`ComputeTier`):**
+  * **Old:** Required reaching full upper bitrates (e.g., 8.0 Mbps for 1080p).
+  * **New:** Uses practical safe throughput requirement thresholds:
+    * **1080p:** $T_{safe} \ge 3.5\text{ Mbps}$
+    * **720p:** $T_{safe} \ge 1.5\text{ Mbps}$
+    * **480p:** Fallback ($T_{safe} < 1.5\text{ Mbps}$)
+
+* **Dynamic Encoder Probing & Minimum Bitrate Floors:**
+  * **Old:** Bitrate was static per tier transition.
+  * **New:** Dynamic encoder bitrate recalculation per feedback packet using a **1.30x probing headroom** ($1.30 \times T_{raw}$). Enforces a strict `minEncoderKbps` floor per tier to prevent spatial starvation/blurriness.
+
+* **Improved Fast-Start Startup & Cooldown Logic:**
+  * **Fast-Start Exit Conditions:** Fast-start phase now terminates either when reaching **1080p** or if client playout buffer drops below **300 ms**.
+  * **Switch Cooldown:** Added a **3-second cooldown lock** after any resolution change to allow GStreamer caps pipeline adjustments to stabilize.
+```
+
+---
+
