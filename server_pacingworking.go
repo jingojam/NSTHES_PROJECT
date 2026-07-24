@@ -353,9 +353,11 @@ func (server *Server) DrainQueue() {
 				break
 			} else if transmitDelay > 0.0 {
 				// SCReAM requested a pacing delay (transmitDelay is in seconds)
+				logger.Printf("[Pacing] Delaying packet for %f seconds\n", transmitDelay)
 				time.Sleep(time.Duration(transmitDelay * float64(time.Second)))
 			} else { // transmitDelay == -1.0 (CWND full or stream blocked)
 				// Congestion window or queue limit reached; back off briefly before retrying
+				logger.Printf("[Pacing] CWND full, backing off...\n")
 				time.Sleep(1 * time.Millisecond)
 			}
 		}
