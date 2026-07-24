@@ -15,5 +15,5 @@ echo "Optimal baseline applied. Tshark is logging in the background..."
 sleep 122
 
 # 4. Copy the complete log file over to your shared workspace
-cp /tmp/optimal_log.pcap "/mnt/hgfs/THESIS SHARED FOLDER/"
+cp /tmp/optimal_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
 echo "Log saved to Shared Folder!"

@@ -7,6 +7,7 @@ require (
 	github.com/go-gst/go-gst v1.0.0
 	github.com/mengelbart/roq v0.3.0
 	github.com/mengelbart/scream-go v0.5.0
+	github.com/pion/rtcp v1.2.14
 	github.com/quic-go/quic-go v0.47.0
 )
 

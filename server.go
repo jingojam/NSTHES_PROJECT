@@ -8,23 +8,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time" // Added to handle the 2-second teardown delay
+	"time" 
 	"sync"
+	"encoding/binary"
 
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/mengelbart/roq"
 	"github.com/quic-go/quic-go"
+	"github.com/pion/rtcp"
 	scream "github.com/mengelbart/scream-go"
 )
-
-/*
- * RTCP Packet RFCs:
- * - RTCP APP packet: https://datatracker.ietf.org/doc/html/rfc3550#section-6.7
- * - RTCP Compound packet: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rtpme/e2e2deb3-2f87-4932-a9c5-1dbde47fb12d
- * - RTCP CC Feedback packet: https://datatracker.ietf.org/doc/html/rfc8888#section-3.1
- */
 
 // Flow ID constant = 1
 var flowID uint64 = 1
@@ -50,7 +45,6 @@ var quality = []BitrateTier{
 	{quality: "1080p", targetbitrate: 8000000.0, maxbitrate: 10000000.0, width: 1920, height: 1080},
 }
 
-
 /*
  * Index constants for indexing `quality` Array
  */
@@ -66,6 +60,8 @@ type Packet struct{
 	size int
 	sequenceNumber uint16
 	timestamp time.Time
+	mark bool
+	payload []byte
 }
 
 /*
@@ -98,6 +94,7 @@ func (packet* Packet) Timestamp() time.Time{
 type Server struct {
 	/*thread safety*/
 	qPipeLock sync.RWMutex // read/write lock for modifying a pipeline element
+	paceSenderSignal chan struct{} // go channel for signalling
 	
 	/*Network attributes*/
 	ip   string
@@ -138,6 +135,7 @@ type Server struct {
  */
 func CreateServer(ip string, port uint64) *Server {
 	return &Server {
+		paceSenderSignal:	make(chan struct{}, 1),
 		ip:             ip,
 		port:           port,
 		screamCC:       scream.NewTx(),
@@ -167,62 +165,54 @@ func (server *Server) InitializePipeline(videoFile string) {
 	pipeline := fmt.Sprintf(
 		`filesrc location=%s name=source ! `+
 		`qtdemux name=demux demux.video_0 ! `+
-		`queue ! `+
+		`queue max-size-buffers=1000 max-size-bytes=0 max-size-time=0 ! `+
 		`h264parse name=parser ! `+
 		`avdec_h264 ! `+
 		`videoscale ! `+
 		`capsfilter name=filter caps=video/x-raw,width=%d,height=%d ! `+
 		`x264enc name=encoder bitrate=%d tune=zerolatency speed-preset=ultrafast ! `+
 		`rtph264pay name=payloader mtu=1200 config-interval=1 pt=96 ssrc=12345678 ! `+
-		`appsink name=sink sync=true max-buffers=1 `, videoFile, quality[low].width, quality[low].height, uint(quality[low].targetbitrate/1000), //video quality initially lowest
+		`appsink name=sink sync=true max-buffers=100 `, videoFile, quality[low].width, quality[low].height, uint(quality[low].targetbitrate/1000),
 	)
 	
 	var err error
 	
 	server.pipeline, err = gst.NewPipelineFromString(pipeline)
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to create pipeline: %v\n", err)
 	}
 	
 	server.source, err    = server.pipeline.GetElementByName("source")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize source element: %v\n", err)
 	}
 	
 	server.demux, err     = server.pipeline.GetElementByName("demux")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize demux element: %v\n", err)
 	}
 	
 	server.parser, err    = server.pipeline.GetElementByName("parser")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize parser element: %v\n", err)
 	}
 	
 	server.capsfilter, err = server.pipeline.GetElementByName("filter")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize capsfilter element: %v\n", err)
 	}
 	
 	server.encoder, err = server.pipeline.GetElementByName("encoder")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize encoder element: %v\n", err)
 	}
 	
 	server.payloader, err = server.pipeline.GetElementByName("payloader")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize payloader element: %v\n", err)
 	}
 	
 	server.sink, err      = server.pipeline.GetElementByName("sink")
-	
 	if err != nil{
 		fmt.Printf("[Error] Failed to initialize sink element: %v\n", err)
 	}
@@ -231,41 +221,29 @@ func (server *Server) InitializePipeline(videoFile string) {
 /*
  * Function to modify Server pipeline's `capsfilter` element to adjust video resolution
  *  and `bitrate` property of the `encoder` element for adjusting video bitrate
- *
- * Parameters:
- *	- tier as an integer (low quality = 0, mid quality = 1, high quality = 2)
  */
 func (server *Server) AdjustVideoQuality(tier int){
-	// obtain a WRITE lock in case to prevent race conditions with Gstreamer
 	server.qPipeLock.Lock()
 	defer server.qPipeLock.Unlock()
 	
-	// create a new capsfilter element
 	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", quality[tier].width, quality[tier].height))
-	
-	// set the new capsfilter
 	err := server.capsfilter.SetProperty("caps", caps)
-	
 	if err != nil{
 		fmt.Printf("[Error] Error adjusting video quality: %v\n", err)
 		return
 	}
 	
-	// set the bitrate property of the encoder to the specified quality tier
 	err = server.encoder.SetProperty("bitrate", uint(quality[tier].targetbitrate/1000))
-	
 	if err != nil{
 		fmt.Printf("[Error] Error adjusting encoder: %v\n", err)
 		return
 	}
 	
-	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n", time.Now(), quality[tier].quality)
+	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n\n", time.Now().Format("15:04:05.000"), quality[tier].quality)
 }
 
 /*
  * Function to initialize a QUIC Connection
- *
- * Returns an error if any, NULL otherwise
  */
 func (server *Server) CreateQUICConnection() error {
 	cwd, err := os.Getwd()
@@ -291,7 +269,7 @@ func (server *Server) CreateQUICConnection() error {
 		return fmt.Errorf("[Error] Error listening on UDP socket: %v", err)
 	}
 	
-	keylogWriter, err := os.OpenFile("secrets.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	keylogWriter, err := os.OpenFile("secrets.txt", os.O_CREATE|os.O_WRONLY, 0600)
 	quicTransport := &quic.Transport{Conn: udpConnection}
 	
 	tlsConfig := &tls.Config {
@@ -325,8 +303,6 @@ func (server *Server) CreateQUICConnection() error {
 
 /*
  * Function for creating RTP over QUIC connection, QUIC session, and sender Flow
- *
- *	Returns an error if any, NULL otherwise
  */
 func (server *Server) InitializeServer() error {
 	err := server.CreateQUICConnection()
@@ -335,7 +311,6 @@ func (server *Server) InitializeServer() error {
 	}
 	
 	roqConnection := roq.NewQUICGoConnection(server.quicConnection)
-	
 	session, err := roq.NewSession(roqConnection, true, nil)
 	if err != nil {
 		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
@@ -348,30 +323,24 @@ func (server *Server) InitializeServer() error {
 		return fmt.Errorf("[Error] Error establishing send flow: %w", err)
 	}
 	
-	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, 100000, 50000000, 50000000)
-	
+	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, quality[low].targetbitrate, quality[low].targetbitrate, quality[high].maxbitrate)
 	fmt.Println("[Status] Server initialized")
-	
 	return nil
 }
 
 /*
  * Function to start Server pipelines
- *
- * Returns an error if any, NULL otherwise
  */
 func (server *Server) StartStream() error {
 	err := server.InitializeServer()
 	if err != nil {
 		return fmt.Errorf("[Error] Failed to initialize server: %v", err)
 	}
-	
-	//create a background thread for listening to feedback from the client
-	go server.ReceiveFeedback()
-	
-	// Create MainLoop prior to callbacks so closure context captures it smoothly
-	mainLoop := glib.NewMainLoop(nil, true)
 
+	go server.ReceiveFeedback()
+	go server.SendPace()
+	
+	mainLoop := glib.NewMainLoop(nil, true)
 	appSink := app.SinkFromElement(server.sink)
 	appSink.SetCallbacks(&app.SinkCallbacks{
 		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
@@ -390,31 +359,28 @@ func (server *Server) StartStream() error {
 			mapinfo := buffer.Map(gst.MapRead)
 			defer buffer.Unmap()
 			
-			// create a `Packet` struct containing these fields from the RTP packet to pass as an argument in scream QUEUE
 			data:= mapinfo.Bytes()
-			sequenceNumber := uint16(data[2])<<8 | uint16(data[3])
+			sequenceNumber := binary.BigEndian.Uint16(data[2:4])
 			size := len(data)
-			mark := (data[1] & 0x80) != 0 // RTP marker bit
+			mark := (data[1] & 0x80) != 0
+
+			payload := make([]byte, size)
+			copy(payload, data)
+			
+			now := time.Now()
 
 			pkt := &Packet{
 				size:           size,
 				sequenceNumber: sequenceNumber,
-				timestamp:      time.Now(),
+				timestamp:      now,
+				mark:			mark,
+				payload:		payload,
 			}
-			
-			server.screamCC.NewMediaFrame(time.Now(), 12345678, size, mark)
-			server.screamCC.IsOkToTransmit(time.Now(), 12345678)
 			
 			server.screamQueue.Enqueue(pkt)
-			
-			err := server.sendFlow.WriteRTPBytes(data) // send the RTP/QUIC packet to the client
-			if err != nil {
-				fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
-				return gst.FlowError
-			}
-		
-			server.screamQueue.Dequeue()
-			server.screamCC.AddTransmitted(time.Now(), 12345678, size, sequenceNumber, mark)
+			server.screamCC.NewMediaFrame(now, 12345678, pkt.size, pkt.mark)
+			fmt.Printf("<%s> [SCReAM Log] %s, queue length = %d, bytes in queue = %d b\n\n", now.Format("15:04:05.000"), server.screamCC.GetStatistics(time.Now()), server.screamQueue.SizeOfQueue(), server.screamQueue.BytesInQueue())
+			server.SignalPaceSender() // signal pacing sender, since NewMediaFrame requires IsOkToTransmit to be executed after
 			
 			return gst.FlowOK
 		},
@@ -422,40 +388,76 @@ func (server *Server) StartStream() error {
 	
 	server.pipeline.SetState(gst.StatePlaying)
 	mainLoop.Run()
-	
 	return nil
 }
 
-/*
- * Function for parsing RTCP Compound packet received from the client peer
- * 
- * Parameters: 
- *	- byte array which contains RTCP APP Packet containing client buffer time + RTCP CC Feedback Packet containing SCReAM metrics
- *
- * Returns a tuple of bytes (1st = RTCP CC Feedback Packet, 2nd = RTCP APP Packet)
- */
-func (server *Server) ParseCompoundRTCP(compoundPacket []byte) ([]byte, []byte){
-	// RTCP CC Feedback packet
-	// get size of the RTCP CC Feedback packet first via the `length` packet field
-	feedbackLength := (uint16(compoundPacket[2]) << 8) | uint16(compoundPacket[3]) 
-	feedbackSize := int(feedbackLength + 1) * 4
-	
-	// the RTCP CC feedback packet is from index 0 -> feedback length - 1
-	feedbackPacket := compoundPacket[:feedbackSize]
-	
-	// RTCP APP Packet
-	// then, the RTCP APP packet is right after the RTCP CC Feedback packet
-	appPacket := compoundPacket[feedbackSize:]
-	
-	return feedbackPacket, appPacket
+func(server *Server) SignalPaceSender(){
+	select{
+		case server.paceSenderSignal <- struct{}{}: // send an empty struct to the signalling channel to trigger a signal
+		default:
+		// signal is discarded
+	}
 }
 
+func(server *Server) SendPace(){
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
+	
+	for{
+		// SCReAM check to validate if it's ok to send packets to client
+		now := time.Now()
+		okToSend := server.screamCC.IsOkToTransmit(now, 12345678)
+		
+		if okToSend == 0.0{ 		// 0 = ok to transmit
+			// dequeue packet from SCReAM queue and then send the rtp packet
+			pkt, ok := server.screamQueue.Dequeue()
+			
+			if ok{
+				err := server.sendFlow.WriteRTPBytes(pkt.payload)
+				
+				if err != nil {
+					fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
+					return
+				}
+				
+				// check when is the next time to call IsOkToTransmit again
+				nextCall := server.screamCC.AddTransmitted(now, 12345678, pkt.size, pkt.sequenceNumber, pkt.mark)
+				
+				if nextCall > 0{
+					// set a timer of the specified amount if tehre is
+					timer.Reset(time.Duration(nextCall * float64(time.Second)))
+					
+				} else{
+					// otherwise if the timer is 0 (now), go back to the start again to call IsOkToTransmit
+					continue
+				}
+			} else{
+				timer.Stop()
+			}
+		} else if okToSend > 0.0{ // >0 = time until IsOkToTransmit() should be called again
+			// sleep for okToSend amount of time
+			timer.Reset(time.Duration(okToSend * float64(time.Second)))
+		} else{ // <0 = queue empty, or the scream congestion window is full
+			// wait 
+			timer.Stop()
+		}
+		
+		// block the goroutine and wait for timer to end, or signal from other functions
+		select{
+			case <-timer.C: // if timer ends, jump back to the start of the for-loop
+			case <-server.paceSenderSignal: // if signalled by another function, jump back to the start of the for-loop
+				timer.Stop()
+		}
+	}
+}	
+
 /*
- * Function for receiving RTCP feedback from the CLient
+ * Function for receiving RTCP feedback from the Client
+ * Retuned to isolate the trailing 16-byte tracking packet safely
  */
 func (server *Server) ReceiveFeedback(){
 	for{
-		//receive a QUIC datagram containing the compound RTCP packet
 		compoundPacket, err := server.quicConnection.ReceiveDatagram(context.Background())
 		
 		if err != nil{
@@ -463,113 +465,117 @@ func (server *Server) ReceiveFeedback(){
 			return
 		}
 		
-		feedbackPacket, appPacket := server.ParseCompoundRTCP(compoundPacket)
+		if len(compoundPacket) < 12 {
+			continue
+		}
 		
-		// parse the RTCP CC feedback packet
-		server.screamCC.IncomingStandardizedFeedback(time.Now(), feedbackPacket)
+		feedbackLength := (int(binary.BigEndian.Uint16(compoundPacket[2:4])) + 1) * 4
+		if len(compoundPacket) < feedbackLength {
+			continue
+		}
 		
-		// raw data of the RTCP APP packet is after the header (byte 12)
-		rawData := appPacket[12:]
-		clientBuffer := make([]uint32, (len(rawData))/4)
+		// get the length fields from the rtcp header
 		
-		for i := 0; i < len(rawData)/4; i++{
-			index := i * 4 // index per block of 4 bytes
-			clientBuffer[i]  = uint32((rawData[index]) << 24) | uint32((rawData[index+1]) << 16) | uint32((rawData[index+2]) << 8) | uint32(rawData[index+3])
+		// since receiver reports is first, it is at bytes 2-3)
+		rrLen := (int(binary.BigEndian.Uint16(compoundPacket[2:4])) + 1) * 4
+
+		// start offset of SDES (next to RR prefix) is right after RR (last index = size of RR)
+		sdesStart := rrLen
+		// length field is just the base offset of SDES, bytes 2-3 as usual
+		sdesLen := (int(binary.BigEndian.Uint16(compoundPacket[sdesStart+2 : sdesStart+4])) + 1) * 4
+
+		// start offset of feedback packet is sum of sizes of the first 2 packets
+		fbStart := sdesStart + sdesLen
+		fbLen := (int(binary.BigEndian.Uint16(compoundPacket[fbStart+2 : fbStart+4])) + 1) * 4
+
+		// so on
+		appStart := fbStart + fbLen
+		rawFeedback := compoundPacket[fbStart : fbStart+fbLen]
+		rawAppPacket := compoundPacket[appStart:]
+		
+		//fmt.Printf("<%s> [ABR] RTCP Feedback=%d bytes, RTCP app=%d bytes\n\n", time.Now().Format("15:04:05.000"), len(feedbackPacket), len(appPacket))
+		server.screamCC.IncomingStandardizedFeedback(time.Now(), rawFeedback)
+		server.SignalPaceSender()
+		
+		var appPacket rtcp.ApplicationDefined
+		err = appPacket.Unmarshal(rawAppPacket)
+		
+		if err != nil || len(rawAppPacket) < 8{
+			continue
 		}
 
-		//fmt.Println(server.screamCC.GetStatistics(time.Now()))
+		clientBuffer := binary.BigEndian.Uint64(appPacket.Data[:8])
 		
-		server.ABR(clientBuffer[0])
+		if len(appPacket.Data[:8]) > 0 {	
+			server.ABR(uint32(clientBuffer))
+		}
 	}
 }
 
-
 /*
  * Function for computing safe throughput given SCReAM target bitrate (80% safety multiplier)
- *
- * Parameters:
- *	- Traw corresponding to SCReAM target bitrate
- *
- * Returns safe throughput as float64 
  */
 func ComputeSafeThroughput(Traw float64) float64{
-	//alpha = 0.8 (80%)
 	return Traw * 0.8
 }
 
 /*
  * Helper function for deriving video quality tier
- *  from current throughput estimation
- *
- * Parameters:
- *	- q current quality	
- *
- * Returns a video quality tier as int (index)
  */
 func ComputeTier(q float64) int{
 	if q >= quality[high].targetbitrate{
 		return high
 	}
-	
 	if q >= quality[mid].targetbitrate{
 		return mid
 	}
-
 	return low
 }
 
 /*
  * Function for the main ABR Algorithm loop
- * 
- * Parameters:
- *	- clientBuffer buffer time of the client
  */
 func (server *Server) ABR(clientBuffer uint32){
-	// 1) obtain the raw estimations from SCReAM
 	Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
 	
-	if Traw != -1.0{ // -1.0 signifies a drop, so ignore it
-		fmt.Printf("[%s] [ABR] Bcurrent = %d seconds, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n", time.Now(), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
-		//2) apply a safety multiplier to the target
+	if Traw != -1.0{ 
+		fmt.Printf("<%s> [ABR] Bcurrent = %d ms, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
 		Tsafe := ComputeSafeThroughput(Traw)
-		//Bcurrent (buffer occupancy)
-		
-		//3) set the target to the safe bitrate
 		Rtarget := ComputeTier(Tsafe)
 
 		// --------- SCENARIO A ---------
 		if Rtarget > server.Rcurrent{
 			if server.isStartup{
-				fmt.Printf("[%s] [ABR] Fast-start phase: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+				fmt.Printf("<%s> [ABR] Fast-start phase: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
 				server.Rcurrent = Rtarget
 				server.AdjustVideoQuality(Rtarget)
 			} else{
 				if server.upgradeTimer == nil{
 					upgrade := func(){
-						fmt.Printf("[%s] [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+						fmt.Printf("<%s> [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
 						server.Rcurrent = Rtarget
 						server.AdjustVideoQuality(Rtarget)
 						server.upgradeTimer = nil
 					}
-				
 					server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
 				}
 			}
 		} else if Rtarget < server.Rcurrent{ // --------- SCENARIO B ---------
-			if clientBuffer > 1{
-				fmt.Printf("[%s] [ABR] Maintaining %s bitrate tier\n", time.Now(), quality[Rtarget].quality)
+			// FIXED: Now safely restored to your 1-second (1000ms) panic threshold
+			if clientBuffer > 1000{
+				fmt.Printf("<%s> [ABR] Maintaining %s bitrate tier\n\n", time.Now().Format("15:04:05.000"), quality[server.Rcurrent].quality)
 			} else{		
-				fmt.Printf("[%s] [ABR] Downgrading bitrate tier to %s\n", time.Now(), quality[Rtarget].quality)
+				fmt.Printf("<%s> [ABR] Buffer depleted (%d ms). Downgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[Rtarget].quality)
 				server.Rcurrent = Rtarget
 				server.AdjustVideoQuality(Rtarget)
 				server.isStartup = false
 			}
 		} else{ // --------- SCENARIO C ---------
 			if server.upgradeTimer != nil{
-				fmt.Printf("[%s] [ABR] Upgrade timer reset \n", time.Now())
+				fmt.Printf("<%s> [ABR] Upgrade timer reset\n\n", time.Now().Format("15:04:05.000"))
+				server.upgradeTimer.Stop()
 				server.upgradeTimer = nil
 			}
-			
 			if server.Rcurrent == high{
 				server.isStartup = false
 			}
@@ -620,10 +626,6 @@ func main() {
 		os.Exit(1)
 	}
 	
-	// FIX APPLIED HERE:
-	// Gives the QUIC stack and Mininet link 2 seconds to flush the final trailing frames
-	// before tearing down the connection.
 	time.Sleep(2 * time.Second)
-	
 	server.CloseServer()
 }
