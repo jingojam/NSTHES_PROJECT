@@ -15,10 +15,8 @@ import (
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
-	"github.com/mengelbart/roq"
 	"github.com/quic-go/quic-go"
 	"github.com/pion/rtcp"
-	scream "github.com/mengelbart/scream-go"
 )
 
 // Flow ID constant = 1
@@ -53,42 +51,6 @@ var mid int = 1   // quality[1] -> 720p
 var high int = 2  // quality[2] -> 1080p
 
 /*
- * Packet struct for implementing `Packet` interface
- * from the SCReAM Go wrapper
- */
-type Packet struct{
-	size int
-	sequenceNumber uint16
-	timestamp time.Time
-	mark bool
-	payload []byte
-}
-
-/*
- * Function for obtaining packet size field
- * Returns size field in int
- */
-func (packet* Packet) Size() int{
-	return packet.size
-}
-
-/*
- * Function for obtaining packet sequence number
- * Returns sequence number in uint16
- */
-func (packet* Packet) SequenceNumber() uint16{
-	return packet.sequenceNumber
-}
-
-/*
- * Function for obtaining packet timestamp
- * Returns timestamp as a Time struct
- */
-func (packet* Packet) Timestamp() time.Time{
-	return packet.timestamp
-}
-
-/*
  * RoQ Server struct
  */
 type Server struct {
@@ -100,18 +62,13 @@ type Server struct {
 	ip   string
 	port uint64
 	
-	/*SCReAM congestion controller*/
-	screamCC *scream.Tx
-	screamQueue *scream.Queue[*Packet]
-	
 	/*ABR variables*/
 	isStartup	  bool
 	Rcurrent	  int
 	upgradeTimer *time.Timer
 
 	/*QUIC transport attributes*/
-	quicConnection quic.Connection
-	sendFlow       *roq.SendFlow
+	quicConnection *quic.Conn
 	
 	/*GStreamer pipeline elements*/
 	pipeline  *gst.Pipeline
@@ -138,12 +95,9 @@ func CreateServer(ip string, port uint64) *Server {
 		paceSenderSignal:	make(chan struct{}, 1),
 		ip:             ip,
 		port:           port,
-		screamCC:       scream.NewTx(),
-		screamQueue:	scream.NewQueue[*Packet](),
 		isStartup:		true,
 		Rcurrent:		low,
 		quicConnection: nil,
-		sendFlow:       nil,
 		pipeline:       nil,
 		source:         nil,
 		capsfilter:		nil,
@@ -301,44 +255,13 @@ func (server *Server) CreateQUICConnection() error {
 	return nil
 }
 
-/*
- * Function for creating RTP over QUIC connection, QUIC session, and sender Flow
- */
-func (server *Server) InitializeServer() error {
-	err := server.CreateQUICConnection()
-	if err != nil {
-		return fmt.Errorf("[Error] Error establishing QUIC connection: %w", err)
-	}
-	
-	roqConnection := roq.NewQUICGoConnection(server.quicConnection)
-	session, err := roq.NewSession(roqConnection, true, nil)
-	if err != nil {
-		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
-		return fmt.Errorf("[Error] Error establishing session: %w", err)
-	}
-	
-	server.sendFlow, err = session.NewSendFlow(flowID)
-	if err != nil {
-		server.quicConnection.CloseWithError(0, "[Error] QUIC connection closed.")
-		return fmt.Errorf("[Error] Error establishing send flow: %w", err)
-	}
-	
-	server.screamCC.RegisterNewStream(server.screamQueue, 12345678, 1.0, quality[low].targetbitrate, quality[low].targetbitrate, quality[high].maxbitrate)
-	fmt.Println("[Status] Server initialized")
-	return nil
-}
 
 /*
  * Function to start Server pipelines
  */
 func (server *Server) StartStream() error {
-	err := server.InitializeServer()
-	if err != nil {
-		return fmt.Errorf("[Error] Failed to initialize server: %v", err)
-	}
-
+	_ = server.CreateQUICConnection()
 	go server.ReceiveFeedback()
-	go server.SendPace()
 	
 	mainLoop := glib.NewMainLoop(nil, true)
 	appSink := app.SinkFromElement(server.sink)
@@ -360,27 +283,24 @@ func (server *Server) StartStream() error {
 			defer buffer.Unmap()
 			
 			data:= mapinfo.Bytes()
-			sequenceNumber := binary.BigEndian.Uint16(data[2:4])
 			size := len(data)
-			mark := (data[1] & 0x80) != 0
 
 			payload := make([]byte, size)
 			copy(payload, data)
 			
-			now := time.Now()
-
-			pkt := &Packet{
-				size:           size,
-				sequenceNumber: sequenceNumber,
-				timestamp:      now,
-				mark:			mark,
-				payload:		payload,
-			}
+			stats := server.quicConnection.ConnectionStats()
 			
-			server.screamQueue.Enqueue(pkt)
-			server.screamCC.NewMediaFrame(now, 12345678, pkt.size, pkt.mark)
-			fmt.Printf("<%s> [SCReAM Log] %s, queue length = %d, bytes in queue = %d b\n\n", now.Format("15:04:05.000"), server.screamCC.GetStatistics(time.Now()), server.screamQueue.SizeOfQueue(), server.screamQueue.BytesInQueue())
-			server.SignalPaceSender() // signal pacing sender, since NewMediaFrame requires IsOkToTransmit to be executed after
+			fmt.Printf("[QUIC Stats] MinRTT=%v LatestRTT=%v SmoothedRTT=%v MeanDeviation=%v | BytesSent=%d PacketsSent=%d BytesReceived=%d PacketsReceived=%d BytesLost=%d PacketsLost=%d\n",
+				stats.MinRTT, stats.LatestRTT, stats.SmoothedRTT, stats.MeanDeviation,
+				stats.BytesSent, stats.PacketsSent, stats.BytesReceived, stats.PacketsReceived,
+				stats.BytesLost, stats.PacketsLost)
+				
+			err := server.quicConnection.SendDatagram(payload)
+			
+			if err != nil{
+				fmt.Println("[Server Log] Failed to send Datagrams.")
+				return gst.FlowError
+			}
 			
 			return gst.FlowOK
 		},
@@ -391,122 +311,33 @@ func (server *Server) StartStream() error {
 	return nil
 }
 
-func(server *Server) SignalPaceSender(){
-	select{
-		case server.paceSenderSignal <- struct{}{}: // send an empty struct to the signalling channel to trigger a signal
-		default:
-		// signal is discarded
-	}
-}
-
-func(server *Server) SendPace(){
-	timer := time.NewTimer(0)
-	timer.Stop()
-	defer timer.Stop()
-	
-	for{
-		// SCReAM check to validate if it's ok to send packets to client
-		now := time.Now()
-		okToSend := server.screamCC.IsOkToTransmit(now, 12345678)
-		
-		if okToSend == 0.0{ 		// 0 = ok to transmit
-			// dequeue packet from SCReAM queue and then send the rtp packet
-			pkt, ok := server.screamQueue.Dequeue()
-			
-			if ok{
-				err := server.sendFlow.WriteRTPBytes(pkt.payload)
-				
-				if err != nil {
-					fmt.Printf("[Server Log] WriteRTPBytes failed: %v\n", err)
-					return
-				}
-				
-				// check when is the next time to call IsOkToTransmit again
-				nextCall := server.screamCC.AddTransmitted(now, 12345678, pkt.size, pkt.sequenceNumber, pkt.mark)
-				
-				if nextCall > 0{
-					// set a timer of the specified amount if tehre is
-					timer.Reset(time.Duration(nextCall * float64(time.Second)))
-					
-				} else{
-					// otherwise if the timer is 0 (now), go back to the start again to call IsOkToTransmit
-					continue
-				}
-			} else{
-				timer.Stop()
-			}
-		} else if okToSend > 0.0{ // >0 = time until IsOkToTransmit() should be called again
-			// sleep for okToSend amount of time
-			timer.Reset(time.Duration(okToSend * float64(time.Second)))
-		} else{ // <0 = queue empty, or the scream congestion window is full
-			// wait 
-			timer.Stop()
-		}
-		
-		// block the goroutine and wait for timer to end, or signal from other functions
-		select{
-			case <-timer.C: // if timer ends, jump back to the start of the for-loop
-			case <-server.paceSenderSignal: // if signalled by another function, jump back to the start of the for-loop
-				timer.Stop()
-		}
-	}
-}	
-
 /*
  * Function for receiving RTCP feedback from the Client
  * Retuned to isolate the trailing 16-byte tracking packet safely
  */
 func (server *Server) ReceiveFeedback(){
 	for{
-		compoundPacket, err := server.quicConnection.ReceiveDatagram(context.Background())
+		rawAppPacket, err := server.quicConnection.ReceiveDatagram(context.Background())
 		
 		if err != nil{
-			fmt.Printf("[SCReAM Log] Error receiving RTCP feedback: %v\n", err)
+			fmt.Printf("[Server Log] Error receiving RTCP feedback: %v\n", err)
 			return
 		}
 		
-		if len(compoundPacket) < 12 {
+		if len(rawAppPacket) < 8 {
 			continue
 		}
-		
-		feedbackLength := (int(binary.BigEndian.Uint16(compoundPacket[2:4])) + 1) * 4
-		if len(compoundPacket) < feedbackLength {
-			continue
-		}
-		
-		// get the length fields from the rtcp header
-		
-		// since receiver reports is first, it is at bytes 2-3)
-		rrLen := (int(binary.BigEndian.Uint16(compoundPacket[2:4])) + 1) * 4
-
-		// start offset of SDES (next to RR prefix) is right after RR (last index = size of RR)
-		sdesStart := rrLen
-		// length field is just the base offset of SDES, bytes 2-3 as usual
-		sdesLen := (int(binary.BigEndian.Uint16(compoundPacket[sdesStart+2 : sdesStart+4])) + 1) * 4
-
-		// start offset of feedback packet is sum of sizes of the first 2 packets
-		fbStart := sdesStart + sdesLen
-		fbLen := (int(binary.BigEndian.Uint16(compoundPacket[fbStart+2 : fbStart+4])) + 1) * 4
-
-		// so on
-		appStart := fbStart + fbLen
-		rawFeedback := compoundPacket[fbStart : fbStart+fbLen]
-		rawAppPacket := compoundPacket[appStart:]
-		
-		//fmt.Printf("<%s> [ABR] RTCP Feedback=%d bytes, RTCP app=%d bytes\n\n", time.Now().Format("15:04:05.000"), len(feedbackPacket), len(appPacket))
-		server.screamCC.IncomingStandardizedFeedback(time.Now(), rawFeedback)
-		server.SignalPaceSender()
 		
 		var appPacket rtcp.ApplicationDefined
 		err = appPacket.Unmarshal(rawAppPacket)
 		
-		if err != nil || len(rawAppPacket) < 8{
+		if err != nil {
 			continue
 		}
 
 		clientBuffer := binary.BigEndian.Uint64(appPacket.Data[:8])
 		
-		if len(appPacket.Data[:8]) > 0 {	
+		if len(appPacket.Data[:8]) > 0 {
 			server.ABR(uint32(clientBuffer))
 		}
 	}
@@ -536,7 +367,8 @@ func ComputeTier(q float64) int{
  * Function for the main ABR Algorithm loop
  */
 func (server *Server) ABR(clientBuffer uint32){
-	Traw := server.screamCC.GetTargetBitrate(time.Now(), 12345678)
+	// CRITICAL: static as of now, we need a way to compute throughput
+	Traw := quality[high].targetbitrate
 	
 	if Traw != -1.0{ 
 		fmt.Printf("<%s> [ABR] Bcurrent = %d ms, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
@@ -590,9 +422,7 @@ func (server *Server) CloseServer() {
 	if server.pipeline != nil {
 		server.pipeline.SetState(gst.StateNull)
 	}
-	if server.sendFlow != nil {
-		server.sendFlow.Close()
-	}
+	
 	if server.quicConnection != nil {
 		server.quicConnection.CloseWithError(0, "[Status] QUIC connection closed.")
 	}
@@ -617,8 +447,9 @@ func main() {
 
 	server := CreateServer(ip, port)
 	fmt.Println("[Status] Server Created")
-
+	
 	server.InitializePipeline(vfilepath)
+	
 	err := server.StartStream()
 	if err != nil {
 		fmt.Printf("[Error] Error streaming video %v\n", err)

@@ -13,10 +13,8 @@ import (
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
-	"github.com/mengelbart/roq"
 	"github.com/quic-go/quic-go"
 	"github.com/pion/rtcp"
-	scream "github.com/mengelbart/scream-go"
 )
 
 // Flow ID constant = 1
@@ -29,11 +27,8 @@ type Client struct {
 	/*Network attributes*/
 	ip             string
 	port           uint64
-	quicConnection quic.Connection
-	receiveFlow    *roq.ReceiveFlow
 	
-	/*SCReAM congestion controller (feedback)*/
-	screamRx *scream.Rx
+	quicConnection *quic.Conn
 
 	/*Gstreamer elements*/
 	pipeline     *gst.Pipeline
@@ -60,8 +55,6 @@ func CreateClient(ip string, port uint64) *Client {
 		ip:             ip,
 		port:           port,
 		quicConnection: nil,
-		receiveFlow:    nil,
-		screamRx:		scream.NewRx(12345678), // ssrc is 12345678 by default to match server-peer ssrc
 		pipeline:       nil,
 		source:         nil,
 		buffer:			nil,
@@ -140,20 +133,8 @@ func (client *Client) RunClient(outputFile string) error {
 	if err != nil {
 		return fmt.Errorf("failed to dial QUIC address: %w", err)
 	}
-	client.quicConnection = conn
-
-	roqConn := roq.NewQUICGoConnection(conn)
 	
-	session, err := roq.NewSession(roqConn, true, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create RoQ client session: %w", err)
-	}
-
-	flow, err := session.NewReceiveFlow(flowID)
-	if err != nil {
-		return fmt.Errorf("failed to create receive flow: %w", err)
-	}
-	client.receiveFlow = flow
+	client.quicConnection = conn
 
 	mainLoop := glib.NewMainLoop(nil, false)
 
@@ -224,102 +205,29 @@ func (client *Client) GetClientBuffer() uint64{
  *	- mainLoop glib event loop manager 
  */
 func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
-	buffer := make([]byte, 65536)
 	appsource := app.SrcFromElement(client.source)
 
 	for {
-		size, err := client.receiveFlow.Read(buffer)
-		
+		rtpPacket, err := client.quicConnection.ReceiveDatagram(context.Background())
+		size := len(rtpPacket)
+
 		if err != nil {
 			fmt.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
 			break
 		}
 
-		if size == 0 {
+		if len(rtpPacket) < 12 {
 			continue
 		}
-
+		
 		bytes := make([]byte, size)
-		copy(bytes, buffer[:size])
-		
-		ssrc := binary.BigEndian.Uint32(buffer[8:12])
-		sequenceNumber := binary.BigEndian.Uint16(buffer[2:4])
-		ceBits := uint8(0)
-		mark := (buffer[1] & 0x80) != 0
+		copy(bytes, rtpPacket[:size])
 
-		now := toNTP(time.Now())
-
-		// this Receive method needs to be called every time an rtp packet arrives
-		client.screamRx.Receive(now, ssrc, size, sequenceNumber, ceBits, mark)
-		
-		// if its a feedback, send feedback to the server on rtp over the media quic Connection
-		if client.screamRx.IsFeedback(now){
-				feedback, flag := client.screamRx.CreateStandardizedFeedback(now, mark) // feedback is an RTCP CC feedback packet with SCReAM metrics
-
-				if flag{
-					// create a receiver report packet, as type CompoundPacket needs to be prefixed by either an RR/SR
-					rr := &rtcp.ReceiverReport{
-						SSRC: ssrc,
-					}
-
-					rawRR, err := rr.Marshal()
-					
-					if err != nil {
-						fmt.Printf("[SCReAM Log] Error marshaling RR: %v\n\n", err)
-						continue
-					}
-
-					// it also states that the RR must be followed by an SDES packet
-					sdes := rtcp.NewCNAMESourceDescription(ssrc, "client")
-									
-					rawSdes, err := sdes.Marshal()
-					
-					if err != nil {
-						fmt.Printf("[SCReAM Log] Error marshaling SDES: %v\n\n", err)
-						continue
-					}
-					
-					// get the client buffer time in milliseconds
-					clientBuffer := make([]byte, 8)
-					
-					// marshall (big endian) it for network transport
-					binary.BigEndian.PutUint64(clientBuffer, client.GetClientBuffer())
-					
-					// create an RTCP APP (application defined packet) packet
-					appPacket := rtcp.ApplicationDefined{
-						SubType: uint8(0),
-						SSRC:	 ssrc,
-						Name:	 "BUFF",
-						Data: 	 clientBuffer,
-					}
-					
-					rawAppPacket, err := appPacket.Marshal()
-					if err != nil {
-						fmt.Printf("[SCReAM Log] Error marshaling app packet: %v\n\n", err)
-						continue
-					}
-
-					// append all of them in order
-					var compoundPacket []byte
-					compoundPacket = append(compoundPacket, rawRR...)
-					compoundPacket = append(compoundPacket, rawSdes...)
-					compoundPacket = append(compoundPacket, feedback...)
-					compoundPacket = append(compoundPacket, rawAppPacket...)
-					
-					if err != nil{
-						fmt.Printf("\n[SCReAM Log] Error creating compound packet: %v\n", err)
-					}
-					
-					err = client.quicConnection.SendDatagram(compoundPacket) //send the compound packet back to the server
-					
-					if err != nil{
-						fmt.Printf("\n[SCReAM Log] Error sending RTCP feedback: %v\n", err)
-					}
-				}
-		}
-
+		ssrc := binary.BigEndian.Uint32(rtpPacket[8:12])
 		gstbuf := gst.NewBufferFromBytes(bytes)
 		ret := appsource.PushBuffer(gstbuf)
+		
+		go client.SendFeedback(ssrc)
 
 		if ret != gst.FlowOK {
 			break
@@ -331,6 +239,36 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 	mainLoop.Quit()
 }
 
+func (client *Client) SendFeedback(ssrc uint32){
+	// no pacing yet
+	// get the client buffer time in milliseconds
+	clientBuffer := make([]byte, 8)
+					
+	// marshall (big endian) it for network transport
+	binary.BigEndian.PutUint64(clientBuffer, client.GetClientBuffer())
+
+	// create an RTCP APP (application defined packet) packet
+	appPacket := rtcp.ApplicationDefined{
+		SubType: uint8(0),
+		SSRC:	 ssrc,
+		Name:	 "BUFR",
+		Data: 	 clientBuffer,
+	}
+
+	rawAppPacket, err := appPacket.Marshal()
+		
+	if err != nil {
+	fmt.Printf("[Client Log] Error marshaling app packet: %v\n\n", err)
+		return
+	}
+
+	err = client.quicConnection.SendDatagram(rawAppPacket) //send RTCP application defined packet back to the server
+
+	if err != nil{
+		fmt.Printf("\n[Client Log] Error sending RTCP feedback: %v\n", err)
+	}
+}
+
 /*
  * Function for cleaning resources of the client
  */
@@ -338,9 +276,7 @@ func (client *Client) CloseClient() {
 	if client.pipeline != nil {
 		client.pipeline.SetState(gst.StateNull)
 	}
-	if client.receiveFlow != nil {
-		client.receiveFlow.Close()
-	}
+
 	if client.quicConnection != nil {
 		client.quicConnection.CloseWithError(0, "QUIC connection closed.")
 	}
