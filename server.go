@@ -4,23 +4,47 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time" 
 	"sync"
+	"sync/atomic"
 	"encoding/binary"
+	"errors"
 
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/logging"
 	"github.com/pion/rtcp"
 )
 
 // Flow ID constant = 1
 var flowID uint64 = 1
+
+// Global logger: dual-writes to stdout AND a log file, so you get a
+// persistent, greppable record instead of relying on a scrollback buffer
+// that moves faster than you can read it.
+var logger *log.Logger
+var logFile *os.File
+
+func InitLogger(logFileName string) {
+	var err error
+	logFile, err = os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("[Error] Failed to open log file %s: %v. Falling back to stdout only.\n", logFileName, err)
+		logger = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+		return
+	}
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger = log.New(multiWriter, "", log.LstdFlags|log.Lmicroseconds)
+	logger.Println("[Status] Logging module initialized successfully.")
+}
 
 /*
  * Video quality struct
@@ -53,19 +77,32 @@ var high int = 2  // quality[2] -> 1080p
 /*
  * RoQ Server struct
  */
+type QUICMetrics struct{
+	cwndBps	float64
+	inFlightBps	float64
+	smoothedRTT time.Duration
+}
+
 type Server struct {
 	/*thread safety*/
 	qPipeLock sync.RWMutex // read/write lock for modifying a pipeline element
-	paceSenderSignal chan struct{} // go channel for signalling
 	
 	/*Network attributes*/
 	ip   string
 	port uint64
 	
 	/*ABR variables*/
-	isStartup	  bool
-	Rcurrent	  int
-	upgradeTimer *time.Timer
+	metrics atomic.Pointer[QUICMetrics]
+	R_current int
+	isStartup	bool
+	stabilityTimer time.Time
+	isStabilityTimerActive bool
+	stableSince time.Time
+	
+	connectionStartTime time.Time
+	/*Log throttling -- see StartStream's NewSampleFunc and ABR() below.*/
+	lastQuicStatsLogAt time.Time
+	lastAbrLogAt       time.Time
 
 	/*QUIC transport attributes*/
 	quicConnection *quic.Conn
@@ -92,11 +129,11 @@ type Server struct {
  */
 func CreateServer(ip string, port uint64) *Server {
 	return &Server {
-		paceSenderSignal:	make(chan struct{}, 1),
 		ip:             ip,
 		port:           port,
+		R_current:		low,
 		isStartup:		true,
-		Rcurrent:		low,
+		isStabilityTimerActive:	false,
 		quicConnection: nil,
 		pipeline:       nil,
 		source:         nil,
@@ -133,42 +170,42 @@ func (server *Server) InitializePipeline(videoFile string) {
 	
 	server.pipeline, err = gst.NewPipelineFromString(pipeline)
 	if err != nil{
-		fmt.Printf("[Error] Failed to create pipeline: %v\n", err)
+		logger.Printf("[Error] Failed to create pipeline: %v\n", err)
 	}
 	
 	server.source, err    = server.pipeline.GetElementByName("source")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize source element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize source element: %v\n", err)
 	}
 	
 	server.demux, err     = server.pipeline.GetElementByName("demux")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize demux element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize demux element: %v\n", err)
 	}
 	
 	server.parser, err    = server.pipeline.GetElementByName("parser")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize parser element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize parser element: %v\n", err)
 	}
 	
 	server.capsfilter, err = server.pipeline.GetElementByName("filter")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize capsfilter element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize capsfilter element: %v\n", err)
 	}
 	
 	server.encoder, err = server.pipeline.GetElementByName("encoder")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize encoder element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize encoder element: %v\n", err)
 	}
 	
 	server.payloader, err = server.pipeline.GetElementByName("payloader")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize payloader element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize payloader element: %v\n", err)
 	}
 	
 	server.sink, err      = server.pipeline.GetElementByName("sink")
 	if err != nil{
-		fmt.Printf("[Error] Failed to initialize sink element: %v\n", err)
+		logger.Printf("[Error] Failed to initialize sink element: %v\n", err)
 	}
 }
 
@@ -177,23 +214,20 @@ func (server *Server) InitializePipeline(videoFile string) {
  *  and `bitrate` property of the `encoder` element for adjusting video bitrate
  */
 func (server *Server) AdjustVideoQuality(tier int){
-	server.qPipeLock.Lock()
-	defer server.qPipeLock.Unlock()
-	
 	caps := gst.NewCapsFromString(fmt.Sprintf("video/x-raw, width=%d, height=%d", quality[tier].width, quality[tier].height))
 	err := server.capsfilter.SetProperty("caps", caps)
 	if err != nil{
-		fmt.Printf("[Error] Error adjusting video quality: %v\n", err)
+		logger.Printf("[Error] Error adjusting video quality: %v\n", err)
 		return
 	}
 	
 	err = server.encoder.SetProperty("bitrate", uint(quality[tier].targetbitrate/1000))
 	if err != nil{
-		fmt.Printf("[Error] Error adjusting encoder: %v\n", err)
+		logger.Printf("[Error] Error adjusting encoder: %v\n", err)
 		return
 	}
 	
-	fmt.Printf("[%s] [ABR] Adjusted quality to: %s\n\n", time.Now().Format("15:04:05.000"), quality[tier].quality)
+	logger.Printf("[%s] [ABR] Adjusted quality to: %s\n\n", time.Now().Format("15:04:05.000"), quality[tier].quality)
 }
 
 /*
@@ -238,7 +272,37 @@ func (server *Server) CreateQUICConnection() error {
 			}, nil
 		},
 	}
-	quicConfig := &quic.Config{EnableDatagrams: true}
+	quicConfig := &quic.Config{
+		EnableDatagrams: true,
+
+		// Throughput-Based Rules data source: quic-go's internal
+		// congestion controller (NewReno mode, per your setup) reports its
+		// live cwnd on every update via this qlog-style hook. This is the
+		// same UpdatedMetrics callback the qlog file itself is built from
+		// -- we just intercept it in-process instead of parsing a log
+		// file, so ABR() sees it with no extra latency.
+		Tracer: func(ctx context.Context, perspective logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer{
+			// perspective is always Server here (this is the listener
+			// side), but the signature requires accepting it regardless.
+			return &logging.ConnectionTracer{
+				UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int){
+					srtt := rttStats.SmoothedRTT()
+					if srtt <= 0 {
+						return
+					}
+
+					values := &QUICMetrics{
+						cwndBps:     float64(cwnd) * 8 / srtt.Seconds(),
+						inFlightBps: float64(bytesInFlight) * 8 / srtt.Seconds(),
+						smoothedRTT: srtt,
+					}
+
+					// atomic scope would rewrite the value on the pointer 
+					server.metrics.Store(values)
+				},
+			}
+		},
+	}
 
 	listener, err := quicTransport.Listen(tlsConfig, quicConfig)
 	if err != nil {
@@ -251,26 +315,43 @@ func (server *Server) CreateQUICConnection() error {
 		return fmt.Errorf("[Error] Error accepting QUIC connection: %v", err)
 	}
 
-	fmt.Printf("[Status] Accepted connection from %s\n", server.quicConnection.RemoteAddr())
+	logger.Printf("[Status] Accepted connection from %s\n", server.quicConnection.RemoteAddr())
 	return nil
 }
-
 
 /*
  * Function to start Server pipelines
  */
-func (server *Server) StartStream() error {
+func (server *Server) StartStream(mainLoop *glib.MainLoop) error {
 	_ = server.CreateQUICConnection()
-	go server.ReceiveFeedback()
+
+	// Marks t=0 for the Fast-Start phase (see ABR()). Set here rather than
+	// in CreateServer() so it reflects when the connection actually came up,
+	// not when the process started.
+	server.connectionStartTime = time.Now()
+
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	defer stopStream()
 	
-	mainLoop := glib.NewMainLoop(nil, true)
+	go server.ReceiveFeedback(streamCtx)
+	
+	go func() {
+		<-streamCtx.Done()
+		glib.IdleAdd(func() bool{
+			mainLoop.Quit()
+			return false
+		})
+	}()
+	
 	appSink := app.SinkFromElement(server.sink)
 	appSink.SetCallbacks(&app.SinkCallbacks{
+		EOSFunc: func(sink *app.Sink) {
+			logger.Println("[Server Log] End of video file reached (EOS). Stopping engine...")
+			stopStream()
+		},
 		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
 			sample := sink.PullSample()
 			if sample == nil {
-				fmt.Println("[Server Log] End of video file reached (EOS). Stopping engine...")
-				mainLoop.Quit() 
 				return gst.FlowEOS
 			}
 			
@@ -290,15 +371,23 @@ func (server *Server) StartStream() error {
 			
 			stats := server.quicConnection.ConnectionStats()
 			
-			fmt.Printf("[QUIC Stats] MinRTT=%v LatestRTT=%v SmoothedRTT=%v MeanDeviation=%v | BytesSent=%d PacketsSent=%d BytesReceived=%d PacketsReceived=%d BytesLost=%d PacketsLost=%d\n",
-				stats.MinRTT, stats.LatestRTT, stats.SmoothedRTT, stats.MeanDeviation,
-				stats.BytesSent, stats.PacketsSent, stats.BytesReceived, stats.PacketsReceived,
-				stats.BytesLost, stats.PacketsLost)
+			// Throttled: this callback fires once per RTP packet (dozens
+			// to hundreds per second), but the underlying ConnectionStats
+			// barely changes packet-to-packet -- printing it that often
+			// just floods the log without adding information.
+			if time.Since(server.lastQuicStatsLogAt) >= time.Second {
+				logger.Printf("[QUIC Stats] MinRTT=%v LatestRTT=%v SmoothedRTT=%v MeanDeviation=%v | BytesSent=%d PacketsSent=%d BytesReceived=%d PacketsReceived=%d BytesLost=%d PacketsLost=%d\n",
+					stats.MinRTT, stats.LatestRTT, stats.SmoothedRTT, stats.MeanDeviation,
+					stats.BytesSent, stats.PacketsSent, stats.BytesReceived, stats.PacketsReceived,
+					stats.BytesLost, stats.PacketsLost)
+				server.lastQuicStatsLogAt = time.Now()
+			}
 				
 			err := server.quicConnection.SendDatagram(payload)
 			
 			if err != nil{
-				fmt.Println("[Server Log] Failed to send Datagrams.")
+				logger.Println("[Server Log] Failed to send Datagrams.")
+				stopStream()
 				return gst.FlowError
 			}
 			
@@ -308,6 +397,9 @@ func (server *Server) StartStream() error {
 	
 	server.pipeline.SetState(gst.StatePlaying)
 	mainLoop.Run()
+	
+	server.CloseServer()
+	
 	return nil
 }
 
@@ -315,28 +407,31 @@ func (server *Server) StartStream() error {
  * Function for receiving RTCP feedback from the Client
  * Retuned to isolate the trailing 16-byte tracking packet safely
  */
-func (server *Server) ReceiveFeedback(){
+func (server *Server) ReceiveFeedback(ctx context.Context){
 	for{
-		rawAppPacket, err := server.quicConnection.ReceiveDatagram(context.Background())
-		
+		rawAppPacket, err := server.quicConnection.ReceiveDatagram(ctx)
+			
 		if err != nil{
-			fmt.Printf("[Server Log] Error receiving RTCP feedback: %v\n", err)
+			if errors.Is(err, context.Canceled) {
+				return 
+			}
+			logger.Printf("[Server Log] Error receiving RTCP feedback: %v\n", err)
 			return
 		}
-		
+			
 		if len(rawAppPacket) < 8 {
 			continue
 		}
-		
+			
 		var appPacket rtcp.ApplicationDefined
 		err = appPacket.Unmarshal(rawAppPacket)
-		
+			
 		if err != nil {
 			continue
 		}
 
 		clientBuffer := binary.BigEndian.Uint64(appPacket.Data[:8])
-		
+			
 		if len(appPacket.Data[:8]) > 0 {
 			server.ABR(uint32(clientBuffer))
 		}
@@ -363,57 +458,82 @@ func ComputeTier(q float64) int{
 	return low
 }
 
-/*
- * Function for the main ABR Algorithm loop
- */
-func (server *Server) ABR(clientBuffer uint32){
-	// CRITICAL: static as of now, we need a way to compute throughput
-	Traw := quality[high].targetbitrate
-	
-	if Traw != -1.0{ 
-		fmt.Printf("<%s> [ABR] Bcurrent = %d ms, Rcurrent = %s, Traw = %.2f bps, Tsafe = %.2f bps\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[server.Rcurrent].quality, Traw, ComputeSafeThroughput(Traw))
-		Tsafe := ComputeSafeThroughput(Traw)
-		Rtarget := ComputeTier(Tsafe)
 
-		// --------- SCENARIO A ---------
-		if Rtarget > server.Rcurrent{
-			if server.isStartup{
-				fmt.Printf("<%s> [ABR] Fast-start phase: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
-				server.Rcurrent = Rtarget
-				server.AdjustVideoQuality(Rtarget)
-			} else{
-				if server.upgradeTimer == nil{
-					upgrade := func(){
-						fmt.Printf("<%s> [ABR] Elapsed 5 seconds: Upgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), quality[Rtarget].quality)
-						server.Rcurrent = Rtarget
-						server.AdjustVideoQuality(Rtarget)
-						server.upgradeTimer = nil
-					}
-					server.upgradeTimer = time.AfterFunc(5 * time.Second, upgrade)
+func (server *Server) ABR(B_current uint32){
+	if time.Since(server.connectionStartTime) >= 10 * time.Second{
+		server.isStartup = false
+	}		
+	
+	quicMetrics := server.metrics.Load()
+	T_raw := quicMetrics.cwndBps
+	T_safe := ComputeSafeThroughput(T_raw)
+	R_target := ComputeTier(T_safe)
+	R_next := server.R_current
+	
+	if time.Since(server.lastQuicStatsLogAt) >= time.Second {
+		logger.Printf("[QUIC Stats] Tsafe = %.2f, cwndBps = %.2f, inFlightBps = %.2f, smoothedRTT = %s\n", ComputeSafeThroughput(quicMetrics.cwndBps), quicMetrics.cwndBps, quicMetrics.inFlightBps, quicMetrics.smoothedRTT)
+		server.lastQuicStatsLogAt = time.Now()
+	}
+	
+	if R_target > server.R_current{
+		server.stableSince = time.Time{}
+		// SCENARIO A
+		if server.isStartup{
+			R_next = R_target
+		} else{
+			
+			if !server.isStabilityTimerActive{
+				// if no timer active, start one
+				server.stabilityTimer = time.Now()
+				server.isStabilityTimerActive = true
+				R_next = server.R_current
+			} else if time.Since(server.stabilityTimer) >= 5 * time.Second{
+				// else if there's a timer and it's >= 5.0 seconds elapsed
+				R_next = server.R_current + 1 // upgrade 1 step at a time (480p -> 720p)
+				if R_next > high{
+					R_next = high
 				}
-			}
-		} else if Rtarget < server.Rcurrent{ // --------- SCENARIO B ---------
-			// FIXED: Now safely restored to your 1-second (1000ms) panic threshold
-			if clientBuffer > 1000{
-				fmt.Printf("<%s> [ABR] Maintaining %s bitrate tier\n\n", time.Now().Format("15:04:05.000"), quality[server.Rcurrent].quality)
-			} else{		
-				fmt.Printf("<%s> [ABR] Buffer depleted (%d ms). Downgrading bitrate tier to %s\n\n", time.Now().Format("15:04:05.000"), clientBuffer, quality[Rtarget].quality)
-				server.Rcurrent = Rtarget
-				server.AdjustVideoQuality(Rtarget)
-				server.isStartup = false
-			}
-		} else{ // --------- SCENARIO C ---------
-			if server.upgradeTimer != nil{
-				fmt.Printf("<%s> [ABR] Upgrade timer reset\n\n", time.Now().Format("15:04:05.000"))
-				server.upgradeTimer.Stop()
-				server.upgradeTimer = nil
-			}
-			if server.Rcurrent == high{
-				server.isStartup = false
+				server.isStabilityTimerActive = false
+			} else{
+				// timer is active, but has not reached ~5.0 seconds
+				R_next = server.R_current
 			}
 		}
+	} else if R_target < server.R_current{
+		server.stableSince = time.Time{}
+		// SCENARIO B
+		if B_current > 1000{
+			R_next = server.R_current
+		} else{
+			R_next = server.R_current - 1
+			if R_next < low {
+				R_next = low
+			}
+			server.isStartup = false
+		}
+	} else{
+		// SCENARIO C
+		if server.isStabilityTimerActive{
+			server.isStabilityTimerActive = false
+		} 
+		
+		R_next = server.R_current
+		
+		if server.stableSince.IsZero() {
+			server.stableSince = time.Now()
+		}
+		isStable := time.Since(server.stableSince) >= 3*time.Second
+		
+		if server.R_current == high || isStable{
+			server.isStartup = false
+		}
 	}
+	
+	logger.Printf("\n[ABR] Adjusted Video Quality to %s\n\n", quality[R_next].quality)
+	server.AdjustVideoQuality(R_next)
+	server.R_current = R_next 
 }
+
 
 /*
  * Function for cleaning the Server resources
@@ -426,10 +546,15 @@ func (server *Server) CloseServer() {
 	if server.quicConnection != nil {
 		server.quicConnection.CloseWithError(0, "[Status] QUIC connection closed.")
 	}
+	if logFile != nil {
+		logFile.Close()
+	}
 }
 
 func main() {
 	gst.Init(nil)
+
+	InitLogger("server_abr.log")
 	
 	addr := "127.0.0.1:5000"
 	var vfilepath string
@@ -446,13 +571,15 @@ func main() {
 	port, _ := strconv.ParseUint(address[1], 10, 64)
 
 	server := CreateServer(ip, port)
-	fmt.Println("[Status] Server Created")
+	logger.Println("[Status] Server Created")
 	
 	server.InitializePipeline(vfilepath)
 	
-	err := server.StartStream()
+	mainLoop := glib.NewMainLoop(nil, false)
+	err := server.StartStream(mainLoop)
+	
 	if err != nil {
-		fmt.Printf("[Error] Error streaming video %v\n", err)
+		logger.Printf("[Error] Error streaming video %v\n", err)
 		server.CloseServer()
 		os.Exit(1)
 	}

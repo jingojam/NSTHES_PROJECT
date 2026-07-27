@@ -4,11 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"encoding/binary"
+	"errors"
 
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
@@ -20,6 +24,33 @@ import (
 // Flow ID constant = 1
 var flowID uint64 = 1
 
+// feedbackInterval controls how often SendFeedback actually fires. This
+// replaces the previous "one goroutine + one datagram per received RTP
+// packet" behavior, which sent feedback (and drove the server's ABR())
+// dozens of times a second with no interval control at all -- flooding
+// both sides' logs and the network with far more feedback traffic than
+// useful. 50ms matches the cadence the server side already expects.
+const feedbackInterval = 500 * time.Millisecond
+
+// Global logger: dual-writes to stdout AND a log file, mirroring
+// server.go's InitLogger, so client-side behavior is just as reviewable
+// after the fact instead of only living in scrollback.
+var logger *log.Logger
+var logFile *os.File
+
+func InitLogger(logFileName string) {
+	var err error
+	logFile, err = os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("[Error] Failed to open log file %s: %v. Falling back to stdout only.\n", logFileName, err)
+		logger = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+		return
+	}
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger = log.New(multiWriter, "", log.LstdFlags|log.Lmicroseconds)
+	logger.Println("[Status] Logging module initialized successfully.")
+}
+
 /*
  * RoQ Client struct
  */
@@ -29,6 +60,15 @@ type Client struct {
 	port           uint64
 	
 	quicConnection *quic.Conn
+
+	/*Feedback loop state -- written by ReceivePackets (every incoming
+	  packet), read by feedbackLoop's ticker. atomic since they run on
+	  different goroutines and this is just a single uint32 + a flag.*/
+	latestSSRC atomic.Uint32
+	haveSSRC   atomic.Bool
+
+	/*Log throttling for the buffer-level print -- see GetClientBuffer.*/
+	lastBufferLogAt time.Time
 
 	/*Gstreamer elements*/
 	pipeline     *gst.Pipeline
@@ -85,7 +125,7 @@ func (client *Client) InitializePipeline(outputFile string) {
 
 	pipeline, err := gst.NewPipelineFromString(pipelineStr)
 	if err != nil {
-		fmt.Printf("[Error] Failed to parse pipeline launch string: %v\n", err)
+		logger.Printf("[Error] Failed to parse pipeline launch string: %v\n", err)
 		return
 	}
 
@@ -93,7 +133,7 @@ func (client *Client) InitializePipeline(outputFile string) {
 
 	srcElement, err := client.pipeline.GetElementByName("src")
 	if err != nil {
-		fmt.Printf("[Error] Failed to find src element: %v\n", err)
+		logger.Printf("[Error] Failed to find src element: %v\n", err)
 		return
 	}
 	client.source = srcElement
@@ -101,7 +141,7 @@ func (client *Client) InitializePipeline(outputFile string) {
 	// Targets the branch buffer right before the fakesink layout
 	bufferElement, err := client.pipeline.GetElementByName("buffer")
 	if err != nil {
-		fmt.Printf("[Error] Failed to find queue element: %v\n", err)
+		logger.Printf("[Error] Failed to find queue element: %v\n", err)
 		return
 	}
 	
@@ -116,7 +156,7 @@ func (client *Client) InitializePipeline(outputFile string) {
  *
  * Returns an error if any, otherwise NULL
  */
-func (client *Client) RunClient(outputFile string) error {
+func (client *Client) RunClient(mainLoop *glib.MainLoop, outputFile string) error {
 	client.InitializePipeline(outputFile)
 
 	tlsConf := &tls.Config{
@@ -135,18 +175,28 @@ func (client *Client) RunClient(outputFile string) error {
 	}
 	
 	client.quicConnection = conn
-
-	mainLoop := glib.NewMainLoop(nil, false)
-
+	
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	defer stopStream()
+	
 	// Spin up goroutine to feed incoming QUIC packets to GStreamer appsrc
-	go client.ReceivePackets(mainLoop)
+	go client.ReceivePackets(streamCtx, stopStream)
+	go client.feedbackLoop(streamCtx)
+
+	go func() {
+		<-streamCtx.Done()
+		glib.IdleAdd(func() bool{
+			mainLoop.Quit()
+			return false
+		})
+	}()
 
 	client.pipeline.SetState(gst.StatePlaying)
 
-	fmt.Printf("[Status] Client connected. Receiving stream and saving raw TS data to %s...\n", outputFile)
+	logger.Printf("[Status] Client connected. Receiving stream and saving raw TS data to %s...\n", outputFile)
 	mainLoop.Run()
-
-	fmt.Printf("[Status] Streaming finished\n")
+	client.CloseClient()
+	logger.Printf("[Status] Streaming finished\n")
 	return nil
 }
 
@@ -179,20 +229,28 @@ func (client *Client) GetClientBuffer() uint64{
 	duration, err := client.buffer.GetProperty("current-level-time")
 	
 	if err != nil{
-		fmt.Printf("[Error] Error fetching client buffer: %s\n", err)
+		logger.Printf("[Error] Error fetching client buffer: %s\n", err)
 		return 0
 	}
 	
 	nanoseconds, ok := duration.(uint64)
 	
 	if !ok{
-		fmt.Printf("[Error] Buffer property type mismatch\n")
+		logger.Printf("[Error] Buffer property type mismatch\n")
 		return 0	
 	}
 	
 	// Real-time jitter metrics scale accurately inside millisecond boundaries.
 	bufferMS := nanoseconds / 1000000
-	fmt.Printf("Client BUFFER: %d ms\n", bufferMS)
+
+	// Throttled: this is called once per feedbackLoop tick (every 50ms =
+	// 20x/sec). The actual feedback send stays at that cadence -- only
+	// the print is throttled further, so the log stays readable without
+	// changing what data reaches the server.
+	if time.Since(client.lastBufferLogAt) >= 500*time.Millisecond {
+		logger.Printf("Client BUFFER: %d ms\n", bufferMS)
+		client.lastBufferLogAt = time.Now()
+	}
 	
 	return bufferMS
 }
@@ -204,15 +262,18 @@ func (client *Client) GetClientBuffer() uint64{
  * Parameters:
  *	- mainLoop glib event loop manager 
  */
-func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
+func (client *Client) ReceivePackets(ctx context.Context, stop context.CancelFunc){
 	appsource := app.SrcFromElement(client.source)
 
 	for {
-		rtpPacket, err := client.quicConnection.ReceiveDatagram(context.Background())
+		rtpPacket, err := client.quicConnection.ReceiveDatagram(ctx)
 		size := len(rtpPacket)
 
 		if err != nil {
-			fmt.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
+			logger.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
+			if errors.Is(err, context.Canceled) {
+				return 
+			}
 			break
 		}
 
@@ -224,19 +285,45 @@ func (client *Client) ReceivePackets(mainLoop *glib.MainLoop){
 		copy(bytes, rtpPacket[:size])
 
 		ssrc := binary.BigEndian.Uint32(rtpPacket[8:12])
+		// Record the latest SSRC for feedbackLoop's ticker to use --
+		// FIX: this used to be "go client.SendFeedback(ssrc)" fired on
+		// EVERY packet (dozens/sec, no interval control), spawning a
+		// goroutine and a QUIC datagram send per packet and driving the
+		// server's ABR() at the same uncontrolled rate. Recording the
+		// value here is essentially free; the actual send now happens on
+		// feedbackLoop's fixed 50ms ticker instead.
+		client.latestSSRC.Store(ssrc)
+		client.haveSSRC.Store(true)
+
 		gstbuf := gst.NewBufferFromBytes(bytes)
 		ret := appsource.PushBuffer(gstbuf)
-		
-		go client.SendFeedback(ssrc)
 
 		if ret != gst.FlowOK {
 			break
 		}
 	}
-
+	stop()
 	appsource.EndStream()
 	time.Sleep(2 * time.Second) // Let the pipeline drain cleanly
-	mainLoop.Quit()
+}
+
+// feedbackLoop sends SCReAM-style buffer-level feedback back to the
+// server on a fixed cadence, instead of once per received media packet.
+func (client *Client) feedbackLoop(ctx context.Context) {
+	ticker := time.NewTicker(feedbackInterval)
+	defer ticker.Stop()
+
+	for{
+		select{
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !client.haveSSRC.Load(){
+					continue
+				}
+				client.SendFeedback(client.latestSSRC.Load())
+		}
+	}
 }
 
 func (client *Client) SendFeedback(ssrc uint32){
@@ -258,14 +345,14 @@ func (client *Client) SendFeedback(ssrc uint32){
 	rawAppPacket, err := appPacket.Marshal()
 		
 	if err != nil {
-	fmt.Printf("[Client Log] Error marshaling app packet: %v\n\n", err)
+	logger.Printf("[Client Log] Error marshaling app packet: %v\n\n", err)
 		return
 	}
 
 	err = client.quicConnection.SendDatagram(rawAppPacket) //send RTCP application defined packet back to the server
 
 	if err != nil{
-		fmt.Printf("\n[Client Log] Error sending RTCP feedback: %v\n", err)
+		logger.Printf("\n[Client Log] Error sending RTCP feedback: %v\n", err)
 	}
 }
 
@@ -280,10 +367,14 @@ func (client *Client) CloseClient() {
 	if client.quicConnection != nil {
 		client.quicConnection.CloseWithError(0, "QUIC connection closed.")
 	}
+	if logFile != nil {
+		logFile.Close()
+	}
 }
 
 func main() {
 	gst.Init(nil)
+	InitLogger("client_abr.log")
 	addr := "127.0.0.1:5000"
 	outputFile := "received_output.ts"
 
@@ -298,12 +389,14 @@ func main() {
 	ip := address[0]
 	port, _ := strconv.ParseUint(address[1], 10, 64)
 
+	mainLoop := glib.NewMainLoop(nil, false)
 	client := CreateClient(ip, port)
+	
 	defer client.CloseClient()
 
-	err := client.RunClient(outputFile)
+	err := client.RunClient(mainLoop, outputFile)
 	if err != nil {
-		fmt.Printf("[Error] Client failed: %v\n", err)
+		logger.Printf("[Error] Client failed: %v\n", err)
 		os.Exit(1)
 	}
 }
