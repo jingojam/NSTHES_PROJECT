@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 0. Start Tshark with an extended 120-second window
-tshark -i h1-eth0 -a duration:120 -w /tmp/middle_log.pcap &
+tshark -i h1-eth0 -a duration:120 -w /tmp/middle_log_abroq.pcap &
 
 # 1. Clear any old rules
 tc qdisc del dev h1-eth0 root 2>/dev/null
@@ -25,6 +25,8 @@ echo "[60s] Network profile timeline complete. Extending observation window..."
 tc qdisc change dev h1-eth0 root netem delay 20ms rate 12mbit
 sleep 60
 
-# 2. Copy the complete log file
-cp /tmp/middle_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
-echo "Log saved to Shared Folder!"
+# 2. Copy the complete log file and QoS metrics over to your shared workspace
+cp /tmp/middle_log_abroq.pcap "/mnt/hgfs/THESIS SHARED FOLDER/middle_log_abroq.pcap"
+mv /tmp/qos_metrics_abroq.csv "/mnt/hgfs/THESIS SHARED FOLDER/middle_qos_metrics_abroq.csv" 2>/dev/null
+
+echo "Log and QoS CSV saved to Shared Folder!"

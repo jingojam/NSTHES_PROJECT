@@ -265,33 +265,72 @@ func (client *Client) GetClientBuffer() uint64{
 func (client *Client) ReceivePackets(ctx context.Context, stop context.CancelFunc){
 	appsource := app.SrcFromElement(client.source)
 
+	// --- CSV Logging Setup ---
+	csvFile, err := os.Create("/tmp/qos_metrics_abroq.csv")
+	if err == nil {
+		defer csvFile.Close()
+		csvFile.WriteString("frame.number,frame.time_relative,frame.time_delta,frame.len,rtp.seq\n")
+		logger.Println("[Log] Writing QoS metrics to /tmp/qos_metrics_abroq.csv")
+	} else {
+		logger.Printf("[Warning] Could not create CSV log file: %v\n", err)
+	}
+
+	var frameCount uint64 = 0
+	var startTime time.Time
+	var lastTime time.Time
+	// -------------------------
+
 	for {
 		rtpPacket, err := client.quicConnection.ReceiveDatagram(ctx)
 		size := len(rtpPacket)
 
+		// Connection closed or context cancelled
 		if err != nil {
-			logger.Printf("\n[Client Log] Server finished transmission. Wrapping up video file...\n")
+			logger.Printf("\n[Client Log] Connection closed. Wrapping up video file...\n")
 			if errors.Is(err, context.Canceled) {
 				return 
 			}
 			break
 		}
 
-		if len(rtpPacket) < 12 {
+		// RESTORED EOF STOPPER
+		// If the packet is smaller than a standard 12-byte RTP header, check if it's the EOF signal
+		if size < 12 {
+			payload := string(rtpPacket)
+			if payload == "EOF" || payload == "END" {
+				logger.Printf("\n[Client Log] Received End-Of-Stream stopper ('%s') from server. Wrapping up...\n", payload)
+				break
+			}
+			// If it's just random noise under 12 bytes, ignore it
 			continue
 		}
+		
+		// --- Extract Metrics & Write to CSV ---
+		frameCount++
+		now := time.Now()
+		
+		if frameCount == 1 {
+			startTime = now
+			lastTime = now
+		}
+		
+		timeRelative := now.Sub(startTime).Seconds()
+		timeDelta := now.Sub(lastTime).Seconds()
+		lastTime = now
+
+		// RTP Sequence Number is stored in bytes 2 and 3 (Big Endian)
+		seq := binary.BigEndian.Uint16(rtpPacket[2:4])
+
+		if csvFile != nil {
+			csvFile.WriteString(fmt.Sprintf("%d,%.6f,%.6f,%d,%d\n", frameCount, timeRelative, timeDelta, size, seq))
+		}
+		// --------------------------------------
 		
 		bytes := make([]byte, size)
 		copy(bytes, rtpPacket[:size])
 
 		ssrc := binary.BigEndian.Uint32(rtpPacket[8:12])
-		// Record the latest SSRC for feedbackLoop's ticker to use --
-		// FIX: this used to be "go client.SendFeedback(ssrc)" fired on
-		// EVERY packet (dozens/sec, no interval control), spawning a
-		// goroutine and a QUIC datagram send per packet and driving the
-		// server's ABR() at the same uncontrolled rate. Recording the
-		// value here is essentially free; the actual send now happens on
-		// feedbackLoop's fixed 50ms ticker instead.
+		// Record the latest SSRC for feedbackLoop's ticker to use
 		client.latestSSRC.Store(ssrc)
 		client.haveSSRC.Store(true)
 
@@ -302,6 +341,8 @@ func (client *Client) ReceivePackets(ctx context.Context, stop context.CancelFun
 			break
 		}
 	}
+	
+	// Clean shutdown sequence
 	stop()
 	appsource.EndStream()
 	time.Sleep(2 * time.Second) // Let the pipeline drain cleanly
