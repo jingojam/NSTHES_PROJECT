@@ -1,7 +1,14 @@
 #!/bin/bash
 
-# 0. Start Tshark with an extended 120-second window
-tshark -i h1-eth0 -a duration:120 -w /tmp/middle_log.pcap &
+H2_PID=$1
+
+if [ -z "$H2_PID" ]; then
+    echo "[Error] H2_PID not provided to network script!"
+    exit 1
+fi
+
+# 0. Start Tshark on the RECEIVER (h2) namespace to capture raw traffic
+nsenter -t $H2_PID -n tshark -i h2-eth0 -a duration:120 -w /tmp/middle_log_baseline_roq.pcap &
 
 # 1. Clear any old rules
 tc qdisc del dev h1-eth0 root 2>/dev/null
@@ -23,8 +30,13 @@ done
 
 echo "[60s] Network profile timeline complete. Extending observation window..."
 tc qdisc change dev h1-eth0 root netem delay 20ms rate 12mbit
-sleep 60
 
-# 2. Copy the complete log file
-cp /tmp/middle_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
-echo "Log saved to Shared Folder!"
+# Wait for remainder of the 120s capture plus safety buffer
+sleep 62
+
+# 2. Copy the files over to your shared workspace
+# We move and rename the CSV generated directly by client.go
+cp /tmp/middle_log_baseline_roq.pcap "/mnt/hgfs/THESIS SHARED FOLDER/"
+mv /tmp/qos_metrics_baseline_roq.csv "/mnt/hgfs/THESIS SHARED FOLDER/middle_qos_metrics_baseline_roq.csv" 2>/dev/null
+
+echo "Log and QoS CSV saved to Shared Folder!"

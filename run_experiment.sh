@@ -1,9 +1,5 @@
 #!/bin/bash
 
-WD=$(pwd)
-
-echo "$WD"
-
 # Ensure script is run with sudo
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (sudo ./run_experiment.sh <scenario> <video_file>)"
@@ -14,7 +10,7 @@ SCENARIO=$1   # optimal, middle, suboptimal
 VIDEO_FILE=$2 # path to the input video file
 
 if [[ -z "$SCENARIO" || -z "$VIDEO_FILE" ]]; then
-    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal|gilbert-elliot|static-loss|combined> <path_to_video>"
+    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal> <path_to_video>"
     exit 1
 fi
 
@@ -34,9 +30,9 @@ fi
 echo "[Status] Found h1 (PID: $H1_PID) and h2 (PID: $H2_PID)"
 
 # 2. Define staging TS file and final MP4 destination
-SHARED_DIR="${WD}/"
-RAW_TS="${WD}/received_output.ts"
-FINAL_MP4="${WD}/received_${SCENARIO}.mp4"
+SHARED_DIR="/mnt/hgfs/THESIS SHARED FOLDER"
+RAW_TS="$SHARED_DIR/received_${SCENARIO}.ts"
+FINAL_MP4="$SHARED_DIR/received_${SCENARIO}.mp4"
 
 # Clean up any leftover staging file from previous attempts
 rm -f "$RAW_TS"
@@ -46,7 +42,7 @@ echo "[Executing] Launching Server on h1..."
 sudo mnexec -a $H1_PID ./server_app 10.0.0.1:5000 "$VIDEO_FILE" > /tmp/server_execution.log 2>&1 &
 SERVER_PROC_PID=$!
 
-sleep 5
+sleep 2
 
 # 4. Launch the Client on h2 (Background) -> Saving TS stream
 echo "[Executing] Launching Client on h2 (Capturing TS stream)..."
@@ -54,19 +50,14 @@ sudo mnexec -a $H2_PID ./client_app 10.0.0.1:5000 "$RAW_TS" > /tmp/client_execut
 CLIENT_PROC_PID=$!
 
 # 5. Launch specific Network Profile script on h1 (Foreground)
+# PASSING $H2_PID so the network scripts can run tshark on the receiver
 echo "[Executing] Triggering Network Scenario Profile..."
 if [ "$SCENARIO" == "optimal" ]; then
-    sudo mnexec -a $H1_PID ./optimal_network.sh
+    sudo mnexec -a $H1_PID ./optimal_network.sh $H2_PID
 elif [ "$SCENARIO" == "middle" ]; then
-    sudo mnexec -a $H1_PID ./middle_network.sh
+    sudo mnexec -a $H1_PID ./middle_network.sh $H2_PID
 elif [ "$SCENARIO" == "suboptimal" ]; then
-    sudo mnexec -a $H1_PID ./suboptimal_network.sh
-elif [ "$SCENARIO" == "gilbert-elliot" ]; then
-    sudo mnexec -a $H1_PID ./gilbert_elliot.sh
-elif [ "$SCENARIO" == "static-loss" ]; then
-    sudo mnexec -a $H1_PID ./static_loss_rate.sh
-elif [ "$SCENARIO" == "combined" ]; then
-    sudo mnexec -a $H1_PID ./combined.sh
+    sudo mnexec -a $H1_PID ./suboptimal_network.sh $H2_PID
 else
     echo "[Error] Invalid scenario choice."
     sudo pkill -f "server_app"
@@ -89,15 +80,14 @@ sleep 1
 echo "[Cleanup] Stream fully captured! Stopping server..."
 sudo pkill -f "server_app"
 
-# 8. Post-Processing: TS Timestamp Preservation, Scaling, & Exact Frame Padding
-echo "[Processing] Aligning TS container, scaling to 1080p, and forcing exact 1800-frame output..."
+# 8. Post-Processing: TS Timestamp Preservation & Exact Frame Padding
+echo "[Processing] Aligning TS container and forcing exact 1800-frame output..."
 
 # 1. We use fps=30 to lock internal timestamps and freeze-frame any network drops.
-# 2. We use scale=1920:1080 to up-sample the raw network video to 1080p for VMAF compatibility.
-# 3. We use tpad with 'stop=-1' to guarantee a massive tail of cloned frames.
-# 4. We use -frames:v 1800 to perfectly slice the padded video at exactly 1800 frames.
+# 2. We use tpad with 'stop=-1' to guarantee a massive tail of cloned frames.
+# 3. We use -frames:v 1800 to perfectly slice the padded video at exactly 1800 frames.
 ffmpeg -y -i "$RAW_TS" \
-  -filter_complex "[0:v]fps=30:round=near,scale=1920:1080,tpad=stop=-1:stop_mode=clone" \
+  -filter_complex "[0:v]fps=30:round=near,tpad=stop=-1:stop_mode=clone" \
   -frames:v 1800 \
   -c:v libx264 -crf 0 -preset ultrafast "$FINAL_MP4"
 

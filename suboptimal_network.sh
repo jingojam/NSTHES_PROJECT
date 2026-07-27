@@ -1,7 +1,14 @@
 #!/bin/bash
 
-# 0. Start Tshark with an extended 120-second window
-tshark -i h1-eth0 -a duration:120 -w /tmp/suboptimal_log.pcap &
+H2_PID=$1
+
+if [ -z "$H2_PID" ]; then
+    echo "[Error] H2_PID not provided to network script!"
+    exit 1
+fi
+
+# 0. Start Tshark on the RECEIVER (h2) namespace to capture raw traffic
+nsenter -t $H2_PID -n tshark -i h2-eth0 -a duration:120 -w /tmp/suboptimal_log_baseline_roq.pcap &
 
 # 1. Clear any old rules
 tc qdisc del dev h1-eth0 root 2>/dev/null
@@ -17,8 +24,11 @@ echo "[10s] PANIC DROP: Throttling strictly to 3 Mbps!"
 tc qdisc change dev h1-eth0 root netem delay 20ms rate 3mbit
 
 echo "Network profile timeline complete. Extending observation window..."
-sleep 110
+sleep 112
 
-# 2. Copy the complete log file
-cp /tmp/suboptimal_log.pcap "/home/jingo-green/Desktop/NSTHES_PROJECT/logs"
-echo "Log saved to Shared Folder!"
+# 2. Copy the files over to your shared workspace
+# We move and rename the CSV generated directly by client.go
+cp /tmp/suboptimal_log_baseline_roq.pcap "/mnt/hgfs/THESIS SHARED FOLDER/"
+mv /tmp/qos_metrics_baseline_roq.csv "/mnt/hgfs/THESIS SHARED FOLDER/suboptimal_qos_metrics_baseline_roq.csv" 2>/dev/null
+
+echo "Log and QoS CSV saved to Shared Folder!"
