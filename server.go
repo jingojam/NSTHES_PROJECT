@@ -274,16 +274,7 @@ func (server *Server) CreateQUICConnection() error {
 	}
 	quicConfig := &quic.Config{
 		EnableDatagrams: true,
-
-		// Throughput-Based Rules data source: quic-go's internal
-		// congestion controller (NewReno mode, per your setup) reports its
-		// live cwnd on every update via this qlog-style hook. This is the
-		// same UpdatedMetrics callback the qlog file itself is built from
-		// -- we just intercept it in-process instead of parsing a log
-		// file, so ABR() sees it with no extra latency.
 		Tracer: func(ctx context.Context, perspective logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer{
-			// perspective is always Server here (this is the listener
-			// side), but the signature requires accepting it regardless.
 			return &logging.ConnectionTracer{
 				UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int){
 					srtt := rttStats.SmoothedRTT()
@@ -489,10 +480,7 @@ func (server *Server) ABR(B_current uint32){
 				R_next = server.R_current
 			} else if time.Since(server.stabilityTimer) >= 5 * time.Second{
 				// else if there's a timer and it's >= 5.0 seconds elapsed
-				R_next = server.R_current + 1 // upgrade 1 step at a time (480p -> 720p)
-				if R_next > high{
-					R_next = high
-				}
+				R_next = R_target
 				server.isStabilityTimerActive = false
 			} else{
 				// timer is active, but has not reached ~5.0 seconds
