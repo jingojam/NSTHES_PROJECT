@@ -14,7 +14,7 @@ SCENARIO=$1   # optimal, middle, suboptimal
 VIDEO_FILE=$2 # path to the input video file
 
 if [[ -z "$SCENARIO" || -z "$VIDEO_FILE" ]]; then
-    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal> <path_to_video>"
+    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal|gilbert-elliot|static-loss|combined> <path_to_video>"
     exit 1
 fi
 
@@ -61,6 +61,12 @@ elif [ "$SCENARIO" == "middle" ]; then
     sudo mnexec -a $H1_PID ./middle_network.sh
 elif [ "$SCENARIO" == "suboptimal" ]; then
     sudo mnexec -a $H1_PID ./suboptimal_network.sh
+elif [ "$SCENARIO" == "gilbert-elliot" ]; then
+    sudo mnexec -a $H1_PID ./gilbert_elliot.sh
+elif [ "$SCENARIO" == "static-loss" ]; then
+    sudo mnexec -a $H1_PID ./static_loss_rate.sh
+elif [ "$SCENARIO" == "combined" ]; then
+    sudo mnexec -a $H1_PID ./combined.sh
 else
     echo "[Error] Invalid scenario choice."
     sudo pkill -f "server_app"

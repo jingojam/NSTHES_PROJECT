@@ -510,7 +510,7 @@ func (server *Server) ABR(B_current uint32){
 		if server.stableSince.IsZero() {
 			server.stableSince = time.Now()
 		}
-		isStable := time.Since(server.stableSince) >= 3*time.Second
+		isStable := time.Since(server.stableSince) >= 5*time.Second
 		
 		if server.R_current == high || isStable{
 			server.isStartup = false
