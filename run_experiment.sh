@@ -10,11 +10,11 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-SCENARIO=$1   # optimal, middle, suboptimal
+SCENARIO=$1   # optimal, middle, suboptimal, packet_loss
 VIDEO_FILE=$2 # path to the input video file
 
 if [[ -z "$SCENARIO" || -z "$VIDEO_FILE" ]]; then
-    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal> <path_to_video>"
+    echo "Usage: sudo ./run_experiment.sh <optimal|middle|suboptimal|packet_loss> <path_to_video>"
     exit 1
 fi
 
@@ -78,6 +78,8 @@ for RUN in {1..5}; do
         sudo mnexec -a $H1_PID ./middle_network.sh
     elif [ "$SCENARIO" == "suboptimal" ]; then
         sudo mnexec -a $H1_PID ./suboptimal_network.sh
+    elif [ "$SCENARIO" == "packet_loss" ]; then
+        sudo mnexec -a $H1_PID ./packet_loss_network.sh
     else
         echo "[Error] Invalid scenario choice."
         sudo pkill -f "server_app"
@@ -97,7 +99,7 @@ for RUN in {1..5}; do
     # Give the OS a split second to release file handlers
     sleep 1
 
-    # 8. Clean up processes, move PCAP, and grant user permissions
+    # 8. Clean up processes, move PCAP, and grant user permissions dynamically
     echo "[Cleanup] Stream fully captured! Stopping server and tshark..."
     sudo pkill -f "server_app"
     sudo pkill -f "tshark"
