@@ -108,7 +108,7 @@ for RUN in {1..5}; do
     if [ -f "$TMP_PCAP" ]; then
         mv "$TMP_PCAP" "$PCAP_FILE"
         chmod 664 "$PCAP_FILE"
-        chown thesis:thesis "$PCAP_FILE" 2>/dev/null
+        chown $SUDO_USER:$SUDO_USER "$PCAP_FILE" 2>/dev/null
     fi
 
     # 9. Post-Processing: TS Timestamp Preservation, Scaling, & Exact Frame Padding
@@ -121,7 +121,7 @@ for RUN in {1..5}; do
 
     # Fix permissions on generated MP4 so GUI file manager can copy it freely
     chmod 664 "$FINAL_MP4"
-    chown thesis:thesis "$FINAL_MP4" 2>/dev/null
+    chown $SUDO_USER:$SUDO_USER "$FINAL_MP4" 2>/dev/null
 
     # Clean up raw staging file to keep workspace neat (Keep PCAP & MP4)
     rm -f "$RAW_TS"
